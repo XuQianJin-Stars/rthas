@@ -14,28 +14,28 @@ Java gets [Arthas](https://github.com/alibaba/arthas) because the JVM can rewrit
 
 ## What you get vs Arthas
 
-| Arthas 能力 | Java 依赖 | Rust 可行方案 | 可行性 | 状态 |
+| Arthas capability | Java relies on | Rust approach | Feasible | Status |
 |---|---|---|---|---|
-| `trace` 调用链+耗时 | 字节码增强 | proc-macro 插桩 | ✅ | ✅ 已实现 |
-| `watch` 入参/返回值 | 字节码增强 | proc-macro，直接拿真值 | ✅ | ✅ 已实现 |
-| `stack` 调用来源 | JVMTI | 进程内 span 路径 + 原生栈 | ✅ | ✅ 已实现（`--native`） |
-| `dashboard` / `thread` | JMX / JVMTI | 自采集：`/proc`、Mach、`getrusage` | ✅ | ✅ 已实现 |
-| `monitor` 周期统计 | 字节码增强 | 环形缓冲按区间聚合 | ✅ | ✅ `dashboard` 内建 |
-| 不重启 attach **已插桩**进程 | Attach API | 触发文件唤醒按需 agent | ✅ | ✅ 已实现 |
-| 不重启 attach **未插桩**进程 | Attach API | 仅 eBPF uprobe（Linux + root + 符号表） | ⚠️ | ❌ 未实现 |
-| `jad` 反编译 / `redefine` 热更 | 运行时重定义类 | 不可能（机器码不可改写） | ❌ | — |
+| `trace` call path + latency | bytecode instrumentation | proc-macro probes | ✅ | ✅ implemented |
+| `watch` args / return value | bytecode instrumentation | proc-macro, reads the real value | ✅ | ✅ implemented |
+| `stack` who called me | JVMTI | in-process span path + native stack | ✅ | ✅ implemented (`--native`) |
+| `dashboard` / `thread` | JMX / JVMTI | self-sampled: `/proc`, Mach, `getrusage` | ✅ | ✅ implemented |
+| `monitor` periodic stats | bytecode instrumentation | ring buffer aggregated per interval | ✅ | ✅ built into `dashboard` |
+| Restart-free attach to an **instrumented** process | Attach API | trigger file wakes a deferred agent | ✅ | ✅ implemented |
+| Restart-free attach to an **un-instrumented** process | Attach API | eBPF uprobe only (Linux + root + symbols) | ⚠️ | ❌ not implemented |
+| `jad` decompile / `redefine` hot swap | runtime class redefinition | impossible (machine code is not rewritable) | ❌ | — |
 
-`attach` 分成两半，各走各的路：
+`attach` splits in two, and each half takes its own route:
 
-- **已插桩的一半已经做完了**：只要二进制带 `#[rthas::trace]`，就能在运行中接管它，不重启、不重编译、不要 root，Linux 和 macOS 都行 —— 见 [Attaching](#attaching-to-a-running-process)。
-- **未插桩的一半还没做**：接管一个从没插过桩的 Rust 进程，只有 eBPF uprobe 一条路，需要 Linux 内核、root 或 `CAP_BPF`、以及带符号表的二进制。rthas 目前没有这个后端。
+- **The instrumented half is done**: as long as the binary carries `#[rthas::trace]`, you can take it over while it runs — no restart, no recompile, no root, on both Linux and macOS. See [Attaching](#attaching-to-a-running-process).
+- **The un-instrumented half is not**: taking over a Rust process that was never instrumented has only one route, eBPF uprobes, and it needs a Linux kernel, root or `CAP_BPF`, and a binary with symbols. rthas has no such backend today.
 
-### 关于 `stack`
+### About `stack`
 
-Arthas 的 `stack` 在 async 代码下也是碎的。`rthas` 做了两手：
+Arthas's `stack` is also fragmented under async code. `rthas` covers both angles:
 
-- **逻辑调用路径**（默认）：直接复用进程内的 span 树，所以跨 `.await`、跨线程跳转后仍然完整 —— 这是 eBPF 和 JVMTI 都给不了的。
-- **原生栈**（`--native`）：`std::backtrace` 在 span 打开时抓一次，对同步代码准确；对 async 代码它只能看到当前正在 poll 的那一帧，所以**以逻辑路径为准**。
+- **Logical call path** (default): reuses the in-process span tree, so it stays intact across `.await` points and thread hops — something neither eBPF nor JVMTI can give you.
+- **Native stack** (`--native`): `std::backtrace` captured once when the span opens; accurate for synchronous code, but for async it only sees the frame currently being polled, so **treat the logical path as the source of truth**.
 
 ### Why async stacks are fragmented
 
@@ -132,7 +132,7 @@ cargo run --bin rthas -- shell
 
 Patterns use shell-style globbing: `*` is wildcard, no-`*` matches by substring. So `get_status` finds `goosefs_sdk::client::master::MasterClient::get_status`. A pattern *with* a `*` is tried at every position, so `MasterClient::*` finds it too.
 
-### `dashboard` 输出
+### `dashboard` output
 
 ```text
 ── rthas dashboard ── pid 14976 ── up 00:00:09 ── 14 cores ──────────────
@@ -146,9 +146,9 @@ Patterns use shell-style globbing: `*` is wildcard, no-`*` matches by substring.
   example_app::lookup_metadata                   4      1  34.132ms  34.140ms  128.680ms
 ```
 
-`CPU` / `MEM` / `load1` / `threads` 由 `sample.rs` 直接从 OS 读，不经过 JVM 之类的中间层；下半部分是把环形缓冲按刷新区间做增量聚合，等价于 Arthas 的 `monitor`。
+`CPU` / `MEM` / `load1` / `threads` are read straight from the OS by `sample.rs`, with no JVM-like middle layer in between; the lower half aggregates the ring buffer incrementally per refresh interval, which is the equivalent of Arthas's `monitor`.
 
-平台差异：`/proc` 能给到每线程的精确 CPU 增量（Linux），Mach 只给瞬时占用率（macOS），且 macOS 的 RSS 取的是 `getrusage` 峰值而非当前值。`--by cpu` 在 macOS 上是瞬时值，其余字段一致。
+Platform differences: `/proc` gives exact per-thread CPU deltas (Linux), while Mach only reports an instantaneous occupancy ratio (macOS), and on macOS the RSS figure is the `getrusage` peak rather than the current value. `--by cpu` is therefore an instantaneous reading on macOS; every other field is identical.
 
 ## Attaching to a running process
 
