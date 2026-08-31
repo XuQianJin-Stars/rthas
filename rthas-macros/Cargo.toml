@@ -1,0 +1,18 @@
+[package]
+name = "rthas-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Proc-macro instrumentation for the rthas probe toolkit"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+# `span-locations` supplies the line number used to uniquify generated statics.
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+# `visit-mut` drives the lifetime renaming pass that makes `async fn` methods
+# with several borrowed parameters compile.
+syn = { version = "2", features = ["full", "visit-mut"] }

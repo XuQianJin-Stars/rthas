@@ -1,0 +1,15 @@
+[package]
+name = "rthas-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Command line client for the rthas probe agent"
+
+[[bin]]
+name = "rthas"
+path = "src/main.rs"
+
+[dependencies]
+# Nothing but std: the agent protocol is line-oriented text over a Unix socket,
+# so `nc` works as a fallback client and the binary stays tiny.

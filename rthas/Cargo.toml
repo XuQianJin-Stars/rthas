@@ -1,0 +1,26 @@
+[package]
+name = "rthas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Arthas-like runtime probe toolkit for Rust: trace / watch / stats without a debugger"
+repository = "https://github.com/Tencent/tencent-goosefs-rust-sdk"
+
+[features]
+default = []
+# Record the current tokio task id on every event. Async futures hop between
+# worker threads, so the task id (not the thread id) is what groups one logical
+# request together. Without it `task` is always 0.
+tokio-task = ["dep:tokio"]
+
+[dependencies]
+rthas-macros = { path = "../rthas-macros", version = "0.1.0" }
+# Link-time probe collection. Unlike a `#[ctor]` hook this works for probes
+# declared inside `impl` methods, which is where most interesting code lives.
+inventory = "0.3"
+# Only for `dashboard` / `thread`: per-thread CPU time and load average have no
+# portable std API, and /proc only exists on Linux. Everything else in the crate
+# is pure std, and this stays off the probe hot path.
+libc = "0.2"
+tokio = { version = "1", default-features = false, features = ["rt"], optional = true }

@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "rthas",
+    "rthas-macros",
+    "rthas-cli",
+    "example-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Goosefs Team"]
+
+# Keep the probe hot path fast even in debug builds: the instrumentation crate
+# itself must not become the bottleneck being measured.
+[profile.release]
+lto = "thin"

@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Control sockets created by running processes.
+/tmp/
