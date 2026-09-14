@@ -177,6 +177,96 @@ pub fn rss_bytes() -> u64 {
     }
 }
 
+/// Process memory snapshot behind the `memory` command.
+///
+/// Rust has no JVM heap, so this is the OS view: RSS, virtual size, open
+/// files. Fields that the platform cannot fill stay at zero.
+#[derive(Clone, Debug, Default)]
+pub struct MemoryInfo {
+    pub rss_bytes: u64,
+    /// `true` when [`Self::rss_bytes`] is a peak (macOS `getrusage`) rather
+    /// than the current resident set.
+    pub rss_is_peak: bool,
+    pub virt_bytes: u64,
+    pub peak_rss_bytes: u64,
+    pub swap_bytes: u64,
+    pub threads: u32,
+    pub fds: u32,
+    pub fd_limit: u32,
+}
+
+/// Read the OS memory picture for this process.
+pub fn memory_info() -> MemoryInfo {
+    let mut info = MemoryInfo {
+        rss_bytes: rss_bytes(),
+        threads: thread_count(),
+        fd_limit: fd_limit(),
+        ..MemoryInfo::default()
+    };
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            info.rss_bytes = status_kb(&status, "VmRSS:").max(info.rss_bytes);
+            info.virt_bytes = status_kb(&status, "VmSize:");
+            info.peak_rss_bytes = status_kb(&status, "VmHWM:");
+            info.swap_bytes = status_kb(&status, "VmSwap:");
+            if let Some(n) = status_u32(&status, "Threads:") {
+                info.threads = n;
+            }
+        }
+        info.fds = open_fds();
+        info.rss_is_peak = false;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        info.rss_is_peak = true;
+        info.peak_rss_bytes = info.rss_bytes;
+    }
+
+    info
+}
+
+#[cfg(target_os = "linux")]
+fn status_kb(status: &str, key: &str) -> u64 {
+    status
+        .lines()
+        .find_map(|line| {
+            let rest = line.strip_prefix(key)?;
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            Some(kb.saturating_mul(1024))
+        })
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "linux")]
+fn status_u32(status: &str, key: &str) -> Option<u32> {
+    status.lines().find_map(|line| {
+        let rest = line.strip_prefix(key)?;
+        rest.split_whitespace().next()?.parse().ok()
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn open_fds() -> u32 {
+    std::fs::read_dir("/proc/self/fd")
+        .map(|rd| rd.count() as u32)
+        .unwrap_or(0)
+}
+
+fn fd_limit() -> u32 {
+    let mut lim = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: `lim` is a live rlimit and getrlimit fills it on success.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, lim.as_mut_ptr()) };
+    if rc != 0 {
+        return 0;
+    }
+    // SAFETY: getrlimit returned 0, so the struct is initialised.
+    let lim = unsafe { lim.assume_init() };
+    lim.rlim_cur as u32
+}
+
 /// One-minute load average, or `0.0` when unavailable.
 pub fn load_avg() -> f64 {
     #[cfg(target_os = "linux")]
@@ -472,7 +562,7 @@ fn timeval_to_duration(tv: libc::timeval) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::{cpu_count, cpu_time, load_avg, rss_bytes, state_name, thread_rows};
+    use super::{cpu_count, cpu_time, load_avg, memory_info, rss_bytes, state_name, thread_rows};
 
     #[test]
     fn reports_plausible_process_numbers() {
@@ -483,6 +573,10 @@ mod tests {
         // Load average can legitimately be 0 on a quiet box, so only require
         // that it parse into a finite number.
         assert!(load_avg().is_finite());
+        let mem = memory_info();
+        assert!(mem.rss_bytes > 0, "memory_info rss should be readable");
+        assert!(mem.threads >= 1);
+        assert!(mem.fd_limit >= 1);
     }
 
     #[test]

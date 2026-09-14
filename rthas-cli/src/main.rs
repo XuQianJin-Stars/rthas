@@ -55,6 +55,8 @@ DISCOVERY:
                                     with #[rthas::trace]
     attach <pid>                    start the agent inside a running process
                                     that deferred it (RTHAS_AGENT=lazy)
+    attach --ebpf <pid>             eBPF uprobes (Linux + root + unstripped;
+                                    process need not carry #[rthas::trace])
     shell                           interactive session
 
 ATTACHING
@@ -63,9 +65,8 @@ ATTACHING
     nothing until `rthas attach <pid>` asks it to bind its socket, so no
     restart and no recompile are needed.
 
-    Either way the binary must carry #[rthas::trace] probes. Attaching to a
-    process that was never instrumented needs eBPF uprobes (Linux + root + an
-    unstripped binary), which rthas does not implement yet.
+    Either way the binary must carry #[rthas::trace] probes, unless you pass
+    `--ebpf`: that loads uprobes from outside (Linux, CAP_BPF/root, symbols).
 
 INSPECTION:
     list [pattern]                  enumerate instrumented functions
@@ -77,7 +78,14 @@ INSPECTION:
                                     (--native, --count N, --depth N)
     stats [pattern]                 p50/p95/p99/max over the ring buffer
     top [pattern] [--n N] [--by total|max|count]
+    monitor [pattern] [opts]        periodic method stats (--interval F,
+                                    --count N, --seconds F)
+    tt <pattern> [opts]             record calls into the time tunnel
+    tt --list [pattern]             list recorded fragments
+    tt --index N                    inspect one fragment
+    tt --delete N / tt --clear      drop one / drop all (no replay)
     on <pattern> / off [pattern]    toggle probes manually
+    reset                           disable all probes
     clear                           drop buffered events
 
 PROCESS:
@@ -85,6 +93,12 @@ PROCESS:
                                     Ctrl-C (--interval F, --count N, --n N)
     thread [opts]                   per-thread CPU and last recorded span
                                     (--n N, --by tid|cpu|name)
+    memory                          OS memory: rss / virt / threads / fds
+    sysenv [NAME]                   process environment (read-only)
+    session                         pid, socket, probes, ring, tunnel
+    options [name] [value]          list or set runtime knobs
+    version                         rthas library version in this process
+    stop                            unbind the agent; attach restarts it
 
 If no target is given and exactly one rthas agent is running, it is used
 automatically. Set RTHAS_SOCK_DIR if your processes use a non-/tmp directory.
@@ -98,6 +112,10 @@ EXAMPLES:
     rthas dashboard --interval 0.5
     rthas thread --by cpu --n 5
     rthas top --n 5 --by max
+    rthas monitor handle_request --interval 1 --count 3
+    rthas tt handle_request --count 5
+    rthas tt --list
+    rthas memory
 ";
 
 /// Accept `rthas --pid 5 list` as a synonym of `rthas list --pid 5`.
@@ -142,7 +160,7 @@ fn main() {
                 .unwrap_or("");
             cmd_ps(all, filter)
         }
-        "attach" => match attach_args(&argv[1..]).and_then(|(pid, dir)| cmd_attach(pid, dir)) {
+        "attach" => match attach_args(&argv[1..]).and_then(cmd_attach) {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("rthas: {e}");
@@ -151,7 +169,8 @@ fn main() {
         },
         "shell" => cmd_shell(&argv[1..]),
         cmd @ ("list" | "trace" | "watch" | "stack" | "dashboard" | "thread" | "stats" | "top"
-        | "on" | "off" | "clear" | "ping") => {
+        | "on" | "off" | "clear" | "ping" | "monitor" | "tt" | "sysenv" | "memory" | "version"
+        | "session" | "options" | "stop" | "reset") => {
             if let Err(e) = cmd_remote(cmd, &argv[1..]) {
                 eprintln!("rthas: {e}");
                 std::process::exit(1);
@@ -462,13 +481,21 @@ fn all_processes() -> Vec<(u32, String)> {
         .collect()
 }
 
-/// Pull the pid out of `attach <pid> [--sock-dir DIR]`.
-fn attach_args(args: &[String]) -> Result<(u32, Option<PathBuf>), String> {
+/// Pull the pid out of `attach [--ebpf] <pid> [--sock-dir DIR]`.
+struct AttachOpts {
+    pid: u32,
+    sock_dir: Option<PathBuf>,
+    ebpf: bool,
+}
+
+fn attach_args(args: &[String]) -> Result<AttachOpts, String> {
     let mut pid = None;
     let mut dir = None;
+    let mut ebpf = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
+            "--ebpf" => ebpf = true,
             "--sock-dir" => dir = it.next().map(PathBuf::from),
             _ if arg.starts_with("--sock-dir=") => {
                 dir = arg.split_once('=').map(|(_, v)| PathBuf::from(v))
@@ -477,13 +504,24 @@ fn attach_args(args: &[String]) -> Result<(u32, Option<PathBuf>), String> {
         }
     }
     match pid {
-        Some(p) => Ok((p, dir)),
-        None => Err("usage: rthas attach <pid> [--sock-dir DIR]".to_string()),
+        Some(pid) => Ok(AttachOpts {
+            pid,
+            sock_dir: dir,
+            ebpf,
+        }),
+        None => Err("usage: rthas attach [--ebpf] <pid> [--sock-dir DIR]".to_string()),
     }
 }
 
 /// Ask a running process to start its agent, then wait for the socket.
-fn cmd_attach(pid: u32, sock_dir: Option<PathBuf>) -> Result<(), String> {
+fn cmd_attach(opts: AttachOpts) -> Result<(), String> {
+    if opts.ebpf {
+        return cmd_attach_ebpf(opts.pid, opts.sock_dir);
+    }
+    cmd_attach_instrumented(opts.pid, opts.sock_dir)
+}
+
+fn cmd_attach_instrumented(pid: u32, sock_dir: Option<PathBuf>) -> Result<(), String> {
     if !process_alive(pid) {
         return Err(format!("no process with pid {pid}"));
     }
@@ -491,9 +529,14 @@ fn cmd_attach(pid: u32, sock_dir: Option<PathBuf>) -> Result<(), String> {
     let sock = dir.join(format!("rthas-{pid}.sock"));
 
     if sock.exists() {
-        println!("pid {pid} already has an agent at {}", sock.display());
-        println!("next: rthas list --pid {pid}");
-        return Ok(());
+        if UnixStream::connect(&sock).is_ok() {
+            println!("pid {pid} already has an agent at {}", sock.display());
+            println!("next: rthas list --pid {pid}");
+            return Ok(());
+        }
+        // `stop` (or a crash) can leave the path behind after the listener
+        // has gone. Treat a dead socket as "not attached".
+        let _ = std::fs::remove_file(&sock);
     }
 
     // Fail fast with a real explanation rather than waiting out the timeout.
@@ -502,9 +545,8 @@ fn cmd_attach(pid: u32, sock_dir: Option<PathBuf>) -> Result<(), String> {
         match is_instrumented(&binary) {
             Some(false) => {
                 return Err(format!(
-                    "{} carries no #[rthas::trace] probes, so there is nothing to attach to.\n\
-                     Attaching to a process that was never instrumented needs eBPF uprobes\n\
-                     (Linux + root + an unstripped binary), which rthas does not implement yet.",
+                    "{} carries no #[rthas::trace] probes.\n\
+                     Use `rthas attach --ebpf {pid}` (Linux + root/CAP_BPF + unstripped symbols).",
                     binary.display()
                 ));
             }
@@ -533,6 +575,94 @@ fn cmd_attach(pid: u32, sock_dir: Option<PathBuf>) -> Result<(), String> {
          Deferred start is opt-in: launch it with RTHAS_AGENT=lazy, or call\n\
          rthas::init_lazy() instead of rthas::init().",
         ATTACH_TIMEOUT.as_secs()
+    ))
+}
+
+fn cmd_attach_ebpf(pid: u32, sock_dir: Option<PathBuf>) -> Result<(), String> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, sock_dir);
+        Err(
+            "eBPF attach requires Linux (kernel 5.5+, CAP_BPF/root, unstripped binary)".into(),
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        cmd_attach_ebpf_linux(pid, sock_dir)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ebpf_helper() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let dir = exe.parent().ok_or("cannot resolve rthas directory")?;
+    let helper = dir.join("rthas-ebpf");
+    if helper.is_file() {
+        return Ok(helper);
+    }
+    Err(format!(
+        "rthas-ebpf helper not found at {}.\nBuild it with: cargo build -p rthas-ebpf",
+        helper.display()
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn cmd_attach_ebpf_linux(pid: u32, sock_dir: Option<PathBuf>) -> Result<(), String> {
+    if !process_alive(pid) {
+        return Err(format!("no process with pid {pid}"));
+    }
+    let dir = sock_dir.unwrap_or_else(default_sock_dir);
+    let sock = dir.join(format!("rthas-{pid}.sock"));
+    if sock.exists() {
+        if UnixStream::connect(&sock).is_ok() {
+            println!("pid {pid} already has an agent at {}", sock.display());
+            println!("next: rthas list --pid {pid}");
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(&sock);
+    }
+    if let Some(binary) = process_binary(pid) {
+        if is_instrumented(&binary) == Some(true) {
+            return Err(format!(
+                "pid {pid} already carries #[rthas::trace]; use `rthas attach {pid}` without --ebpf"
+            ));
+        }
+    }
+    let helper = ebpf_helper()?;
+    let log = dir.join(format!("rthas-ebpf-{pid}.log"));
+    let log_file =
+        std::fs::File::create(&log).map_err(|e| format!("cannot write {}: {e}", log.display()))?;
+    Command::new(&helper)
+        .args([
+            "serve",
+            &pid.to_string(),
+            "--sock-dir",
+            dir.to_str().unwrap_or("/tmp"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(
+            log_file.try_clone().map_err(|e| e.to_string())?,
+        ))
+        .stderr(Stdio::from(log_file))
+        .spawn()
+        .map_err(|e| format!("spawn {}: {e}", helper.display()))?;
+    eprintln!("rthas: starting eBPF helper for pid {pid}, waiting...");
+    let deadline = Instant::now() + ATTACH_TIMEOUT;
+    while Instant::now() < deadline {
+        if sock.exists() && UnixStream::connect(&sock).is_ok() {
+            println!("attached (eBPF) to pid {pid} at {}", sock.display());
+            println!("next: rthas list --pid {pid}");
+            println!("log: {}", log.display());
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let hint = std::fs::read_to_string(&log).unwrap_or_default();
+    Err(format!(
+        "eBPF helper did not bind {} within {}s.\n{}",
+        sock.display(),
+        ATTACH_TIMEOUT.as_secs(),
+        hint.trim()
     ))
 }
 
@@ -641,7 +771,7 @@ fn cmd_shell(args: &[String]) {
             eprintln!("{e}");
             break;
         }
-        if matches!(cmd, "quit" | "exit" | "q") {
+        if matches!(cmd, "quit" | "exit" | "q" | "stop") {
             break;
         }
     }
@@ -684,8 +814,13 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        assert_eq!(attach_args(&args).unwrap().0, 4711);
-        assert_eq!(attach_args(&args).unwrap().1, Some(PathBuf::from("/tmp/x")));
+        assert_eq!(attach_args(&args).unwrap().pid, 4711);
+        assert_eq!(attach_args(&args).unwrap().sock_dir, Some(PathBuf::from("/tmp/x")));
+        assert!(!attach_args(&args).unwrap().ebpf);
+
+        let ebpf = attach_args(&["--ebpf".into(), "9".into()]).unwrap();
+        assert!(ebpf.ebpf);
+        assert_eq!(ebpf.pid, 9);
 
         assert!(attach_args(&[]).is_err());
     }

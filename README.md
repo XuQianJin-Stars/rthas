@@ -1,7 +1,7 @@
 # rthas
 
 > **Arthas-flavoured runtime probe toolkit for Rust**  
-> `trace` / `watch` / `stack` / `stats` / `top` / `dashboard` / `thread` — without a debugger.
+> `trace` / `watch` / `stack` / `stats` / `top` / `dashboard` / `thread` / `attach --ebpf` — without a debugger.
 
 Java gets [Arthas](https://github.com/alibaba/arthas) because the JVM can rewrite bytecode at runtime (Instrumentation), attach to a live process (Attach API), and redefine classes on the fly (JVMTI). Rust is ahead-of-time compiled to machine code with no VM layer, so those tricks are simply unavailable.
 
@@ -20,15 +20,17 @@ Java gets [Arthas](https://github.com/alibaba/arthas) because the JVM can rewrit
 | `watch` args / return value | bytecode instrumentation | proc-macro, reads the real value | ✅ | ✅ implemented |
 | `stack` who called me | JVMTI | in-process span path + native stack | ✅ | ✅ implemented (`--native`) |
 | `dashboard` / `thread` | JMX / JVMTI | self-sampled: `/proc`, Mach, `getrusage` | ✅ | ✅ implemented |
-| `monitor` periodic stats | bytecode instrumentation | ring buffer aggregated per interval | ✅ | ✅ built into `dashboard` |
+| `monitor` periodic stats | bytecode instrumentation | ring buffer aggregated per interval | ✅ | ✅ implemented (also in `dashboard`) |
+| `tt` time tunnel | bytecode + object refs | indexed `Debug` snapshots | ✅ | ✅ record / list / inspect (no replay) |
+| `sysenv` / `memory` / `session` / `options` / `version` / `stop` | JMX / agent | process env, OS memory, runtime knobs | ✅ | ✅ implemented |
 | Restart-free attach to an **instrumented** process | Attach API | trigger file wakes a deferred agent | ✅ | ✅ implemented |
-| Restart-free attach to an **un-instrumented** process | Attach API | eBPF uprobe only (Linux + root + symbols) | ⚠️ | ❌ not implemented |
+| Restart-free attach to an **un-instrumented** process | Attach API | eBPF uprobe only (Linux + root + symbols) | ⚠️ | ✅ `attach --ebpf` (name + latency; no Debug args) |
 | `jad` decompile / `redefine` hot swap | runtime class redefinition | impossible (machine code is not rewritable) | ❌ | — |
 
 `attach` splits in two, and each half takes its own route:
 
 - **The instrumented half is done**: as long as the binary carries `#[rthas::trace]`, you can take it over while it runs — no restart, no recompile, no root, on both Linux and macOS. See [Attaching](#attaching-to-a-running-process).
-- **The un-instrumented half is not**: taking over a Rust process that was never instrumented has only one route, eBPF uprobes, and it needs a Linux kernel, root or `CAP_BPF`, and a binary with symbols. rthas has no such backend today.
+- **The un-instrumented half is Linux-only**: `rthas attach --ebpf <pid>` loads uprobes from outside the process. It needs a Linux kernel (5.5+), root or `CAP_BPF`, and a binary that still has symbols. You get function names and latency via `trace` / `watch`; there are no `Debug` arguments, and async call trees will fragment. See [eBPF attach](#ebpf-attach-uninstrumented-processes).
 
 ### About `stack`
 
@@ -107,6 +109,14 @@ cargo run --bin rthas -- dashboard --interval 1
 # Per-thread CPU and what each thread last did
 cargo run --bin rthas -- thread --by cpu --n 5
 
+# Periodic method stats (enables probes for the duration)
+cargo run --bin rthas -- monitor handle_request --interval 1 --count 3
+
+# Time tunnel: record, then inspect later (no replay — Debug strings only)
+cargo run --bin rthas -- tt handle_request --count 5
+cargo run --bin rthas -- tt --list
+cargo run --bin rthas -- tt --index 1000
+
 # Interactive session
 cargo run --bin rthas -- shell
 ```
@@ -118,6 +128,7 @@ cargo run --bin rthas -- shell
 | `ps` | List processes exposing an rthas agent |
 | `ps --all [filter]` | List every process, flagging those built with `#[rthas::trace]` |
 | `attach <pid>` | Start the agent inside a running process that deferred it |
+| `attach --ebpf <pid>` | eBPF uprobes on an uninstrumented process (Linux + root + symbols) |
 | `list [pattern]` | Enumerate instrumented functions |
 | `on <pattern>` / `off [pattern]` | Toggle probes (off by default) |
 | `trace <pattern> [--count N] [--seconds F] [--depth N] [--min-ms F] [--grace-ms N]` | Stream call trees |
@@ -125,8 +136,18 @@ cargo run --bin rthas -- shell
 | `stack <pattern> [--native] [--count N] [--depth N]` | Call path that reached each matching call |
 | `stats [pattern]` | p50 / p95 / p99 / max over ring buffer |
 | `top [pattern] [--n N] [--by total\|max\|count]` | Hottest or slowest functions |
+| `monitor [pattern] [--interval F] [--count N] [--seconds F]` | Periodic method stats (total / success / fail / avg-rt / fail-rate) |
+| `tt <pattern> [--count N] [--args S] [--ret S]` | Record calls into the time tunnel |
+| `tt --list [pattern]` / `tt --index N` / `tt --delete N` / `tt --clear` | List / inspect / drop fragments (no `tt -p` replay) |
 | `dashboard [--interval F] [--count N] [--n N]` | Live process overview, refreshes until Ctrl-C |
 | `thread [--n N] [--by tid\|cpu\|name]` | Per-thread CPU plus last recorded span |
+| `memory` | OS memory: rss / virt / threads / fds |
+| `sysenv [NAME]` | Process environment (read-only) |
+| `session` | pid, socket, probes, ring, tunnel |
+| `options [name] [value]` | List or set runtime knobs (`max-str`, `tz-hours`) |
+| `version` | rthas library version in the target process |
+| `reset` | Disable all probes |
+| `stop` | Unbind the agent; `rthas attach <pid>` restarts it |
 | `clear` | Drop buffered events |
 | `help` | Full reference |
 
@@ -146,7 +167,7 @@ Patterns use shell-style globbing: `*` is wildcard, no-`*` matches by substring.
   example_app::lookup_metadata                   4      1  34.132ms  34.140ms  128.680ms
 ```
 
-`CPU` / `MEM` / `load1` / `threads` are read straight from the OS by `sample.rs`, with no JVM-like middle layer in between; the lower half aggregates the ring buffer incrementally per refresh interval, which is the equivalent of Arthas's `monitor`.
+`CPU` / `MEM` / `load1` / `threads` are read straight from the OS by `sample.rs`, with no JVM-like middle layer in between; the lower half aggregates the ring buffer incrementally per refresh interval. For Arthas-style method stats on their own (and to enable matching probes automatically), use `monitor`.
 
 Platform differences: `/proc` gives exact per-thread CPU deltas (Linux), while Mach only reports an instantaneous occupancy ratio (macOS), and on macOS the RSS figure is the `getrusage` peak rather than the current value. `--by cpu` is therefore an instantaneous reading on macOS; every other field is identical.
 
@@ -199,6 +220,45 @@ Two notes on the mechanics:
 - The marker `ps --all` and `attach` look for lives in read-only data, not in
   the symbol table, so a stripped release binary is still recognised.
 
+## eBPF attach (uninstrumented processes)
+
+When the target was **not** built with `#[rthas::trace]`, the only attach path
+is eBPF uprobes. This is Linux-only.
+
+```bash
+# Build the helper next to the CLI (Aya needs nightly + bpfel-unknown-none + bpf-linker)
+cargo build -p rthas-cli -p rthas-ebpf -p example-plain
+
+./target/debug/example-plain
+# example-plain pid=1234 (no rthas probes)
+
+sudo ./target/debug/rthas attach --ebpf 1234
+rthas list --pid 1234
+rthas trace handle_request --count 3
+rthas watch handle_request --count 5
+rthas stop --pid 1234
+```
+
+Limits, on purpose:
+
+- Function **name + latency** only. No `Debug` arguments or return values
+  (`--args` / `--ret` are ignored).
+- At most 64 symbols per `trace`/`watch`. `std::` / `core::` / `alloc::` are
+  skipped unless the pattern names them.
+- Async call trees fragment: a uretprobe fires when `poll` returns, not when
+  the future completes. Prefer `#[rthas::trace]` for async services.
+- The binary must still have symbols (`strip` makes attach fail).
+- macOS: `attach --ebpf` errors immediately; there is no kprobe/uprobe API.
+
+Toolchain for compiling `rthas-ebpf` on Linux:
+
+```bash
+rustup toolchain install nightly
+rustup component add rust-src --toolchain nightly
+rustup target add bpfel-unknown-none --toolchain nightly
+cargo install bpf-linker
+```
+
 ## Macro options
 
 ```rust
@@ -229,11 +289,15 @@ A disabled probe has **zero allocation** and is always branch-predicted taken. A
 │  ┌─ rthas (library) ──────────────────────┐ │
 │  │  agent.rs     — control-plane thread    │ │
 │  │  event.rs     — bounded FIFO (16K)      │ │
+│  │  tunnel.rs    — indexed tt fragments    │ │
 │  │  tree.rs      — forest → render         │ │
 │  │  probe.rs     — static sites + registry │ │
 │  │  span.rs      — thread-local stack      │ │
 │  │  sample.rs    — OS metrics: /proc, Mach │ │
 │  │  time.rs      — monotonic + wall-clock  │ │
+│  └──────────────────────────────────────────┘ │
+│  ┌─ rthas-ebpf (Linux helper) ────────────┐ │
+│  │  uprobe/uretprobe → same socket proto  │ │
 │  └──────────────────────────────────────────┘ │
 │         ↑ inventory (link-time collection)    │
 │  ┌─ rthas-macros (proc-macro) ───────────┐ │
@@ -250,8 +314,9 @@ A disabled probe has **zero allocation** and is always branch-predicted taken. A
 | `RTHAS_SOCK_DIR` | `/tmp` | Socket directory |
 | `RTHAS_AGENT` | `1` | `0` skips the agent; `lazy` defers it until `rthas attach` |
 | `RTHAS_CAPACITY` | `16384` | Ring buffer size (events retained) |
-| `RTHAS_MAX_STR` | `256` | Max chars per arg/return value |
-| `RTHAS_TZ_HOURS` | `0` (UTC) | Display timezone offset |
+| `RTHAS_TT_CAPACITY` | `100` | Time-tunnel fragments retained |
+| `RTHAS_MAX_STR` | `256` | Max chars per arg/return value (`options max-str` can change this later) |
+| `RTHAS_TZ_HOURS` | `0` (UTC) | Display timezone offset (`options tz-hours` can change this later) |
 | `RTHAS_MACRO_DEBUG` | off | Print macro expansion to stderr |
 | `RTHAS_DEBUG` | off | Log every event the agent ingests to stderr |
 

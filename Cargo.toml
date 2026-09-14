@@ -4,7 +4,9 @@ members = [
     "rthas",
     "rthas-macros",
     "rthas-cli",
+    "rthas-ebpf",
     "example-app",
+    "example-plain",
 ]
 
 [workspace.package]

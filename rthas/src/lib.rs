@@ -63,16 +63,20 @@ mod sample;
 mod span;
 mod time;
 mod tree;
+mod tunnel;
 
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 pub use crate::agent::{attach_trigger_path, init, init_lazy, socket_path, spawn, spawn_lazy};
 pub use crate::event::{recorder, Event, Recorder, DEFAULT_CAPACITY};
 pub use crate::probe::{glob_match, registry, Probe, ProbeKind, Registry};
 pub use crate::probe::ProbeSubmission;
-pub use crate::sample::{cpu_count, load_avg, rss_bytes, Meter, Sample, ThreadRow};
+pub use crate::sample::{cpu_count, load_avg, memory_info, rss_bytes, MemoryInfo, Meter, Sample, ThreadRow};
 pub use crate::span::SpanGuard;
-pub use crate::time::{format_dur, format_ts, now_ns};
+pub use crate::time::{format_datetime, format_dur, format_ts, now_ns, set_tz_hours, tz_hours};
+pub use crate::tunnel::{tunnel, Fragment, Tunnel, DEFAULT_TT_CAPACITY};
 
 /// The `#[rthas::trace]` attribute. Re-exported so users only need one dep.
 pub use rthas_macros::trace;
@@ -94,15 +98,25 @@ pub const MAGIC: &str = "rthas/probe/v1";
 /// Upper bound on a rendered argument or return value.
 ///
 /// Unbounded `Debug` output of a large struct would blow up the ring buffer
-/// and make the trace unreadable. Override with `RTHAS_MAX_STR`.
-fn max_str() -> usize {
-    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MAX.get_or_init(|| {
-        std::env::var("RTHAS_MAX_STR")
+/// and make the trace unreadable. Override with `RTHAS_MAX_STR`, or at runtime
+/// with `options max-str`.
+fn max_str_cell() -> &'static AtomicUsize {
+    static MAX: OnceLock<AtomicUsize> = OnceLock::new();
+    MAX.get_or_init(|| {
+        let v = std::env::var("RTHAS_MAX_STR")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(256)
+            .unwrap_or(256);
+        AtomicUsize::new(v.max(1))
     })
+}
+
+pub(crate) fn max_str() -> usize {
+    max_str_cell().load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_max_str(chars: usize) {
+    max_str_cell().store(chars.max(1), Ordering::Relaxed);
 }
 
 /// Clip `s` to [`max_str`], marking truncation with an ellipsis.

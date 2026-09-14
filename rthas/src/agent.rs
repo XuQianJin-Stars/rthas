@@ -25,13 +25,16 @@ use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::event::{recorder, Event};
 use crate::probe::{glob_match, registry, Probe};
-use crate::sample::{cpu_count, thread_count, thread_rows, Meter, Sample};
-use crate::time::format_dur;
+use crate::sample::{cpu_count, memory_info, thread_count, thread_rows, Meter, Sample};
+use crate::time::{format_datetime, format_dur, now_ns, set_tz_hours, to_system_time, tz_hours};
 use crate::tree::{render, render_flat, render_stacks, Forest, RenderOpts, Tree};
+use crate::tunnel::tunnel;
+use crate::{max_str, set_max_str};
 
 /// Default number of root calls a `trace` collects before returning.
 const DEFAULT_TRACE_COUNT: usize = 20;
@@ -41,6 +44,15 @@ const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Sentinel written after every response so clients know a reply is complete.
 pub const END: &str = "<<<end>>>";
+
+/// Set by `stop`; the accept loop checks it after each connection.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+/// True while a deferred-attach watcher thread is sitting on the trigger file.
+static LAZY_WATCHING: AtomicBool = AtomicBool::new(false);
+
+/// Flags that never consume the next token (`--native --count 5`).
+const VALUELESS_FLAGS: &[&str] = &["native", "list", "clear"];
 
 /// Where this process's control socket lives.
 ///
@@ -67,11 +79,16 @@ pub fn spawn() -> std::io::Result<PathBuf> {
     // A crashed process can leave a stale socket at a recycled pid.
     let _ = std::fs::remove_file(&path);
 
+    STOP.store(false, Ordering::SeqCst);
     let listener = UnixListener::bind(&path)?;
+    let announced = path.clone();
     std::thread::Builder::new()
         .name("rthas-agent".to_string())
         .spawn(move || {
             for stream in listener.incoming() {
+                if STOP.load(Ordering::SeqCst) {
+                    break;
+                }
                 match stream {
                     Ok(s) => {
                         std::thread::spawn(|| {
@@ -83,6 +100,8 @@ pub fn spawn() -> std::io::Result<PathBuf> {
                     Err(e) => eprintln!("[rthas] accept: {e}"),
                 }
             }
+            drop(listener);
+            let _ = std::fs::remove_file(&announced);
         })?;
     Ok(path)
 }
@@ -131,6 +150,8 @@ impl<'a> Args<'a> {
             if let Some(rest) = tok.strip_prefix("--") {
                 if let Some((k, v)) = rest.split_once('=') {
                     flags.insert(k, v);
+                } else if VALUELESS_FLAGS.contains(&rest) {
+                    flags.insert(rest, "");
                 } else {
                     // A valueless flag must not swallow the next flag, or
                     // `--native --count 5` would read `--count` as native's value.
@@ -204,6 +225,21 @@ fn dispatch<W: Write>(line: &str, out: &mut W) -> std::io::Result<bool> {
         "thread" => cmd_thread(&args, out)?,
         "stats" => cmd_stats(&args, out)?,
         "top" => cmd_top(&args, out)?,
+        "monitor" => cmd_monitor(&args, out)?,
+        "tt" => cmd_tt(&args, out)?,
+        "sysenv" => cmd_sysenv(&args, out)?,
+        "memory" => cmd_memory(out)?,
+        "version" => writeln!(out, "rthas {}", env!("CARGO_PKG_VERSION"))?,
+        "session" => cmd_session(out)?,
+        "options" => cmd_options(&args, out)?,
+        "reset" => {
+            registry().disable_all();
+            writeln!(out, "disabled all probes")?;
+        }
+        "stop" => {
+            cmd_stop(out)?;
+            return Ok(false);
+        }
         "clear" => {
             recorder().clear();
             writeln!(out, "cleared event buffer")?;
@@ -246,6 +282,24 @@ rthas control commands
      --by tid|cpu|name                  sort order (default tid)
   stats [pattern]                       p50/p95/p99/max over the ring buffer
   top [pattern] [--n N] [--by total|max|count]   slowest / hottest functions
+  monitor [pattern] [opts]              periodic method stats (Arthas monitor)
+     --interval F     seconds per frame (default 5.0)
+     --count N        stop after N frames (0 = until Ctrl-C)
+     --seconds F      stop after F seconds
+  tt <pattern> [opts]                   record calls into the time tunnel
+     --count N        stop after N calls (default 0 = until Ctrl-C)
+     --seconds F      stop after F seconds
+     --args S / --ret S                 substring filters, same as watch
+  tt --list [pattern]                   list recorded fragments
+  tt --index N                          inspect one fragment
+  tt --delete N / tt --clear            drop one fragment / drop all
+  sysenv [NAME]                         process environment (read-only)
+  memory                                OS memory: rss / virt / threads / fds
+  version                               rthas library version in this process
+  session                               pid, socket, probes, ring, tunnel
+  options [name] [value]                list or set runtime knobs
+  reset                                 disable all probes (Arthas reset)
+  stop                                  unbind the agent; `rthas attach` restarts it
   clear                                 drop buffered events
   quit                                  close this session
 
@@ -876,6 +930,493 @@ fn cmd_thread<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// monitor: Arthas-style periodic method stats
+// ---------------------------------------------------------------------------
+
+fn cmd_monitor<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
+    let pattern = args.pattern();
+    let interval = Duration::from_secs_f64(args.num("interval", 5.0f64).max(0.05));
+    let max_frames = args.num("count", 0usize);
+    let seconds: f64 = args.num("seconds", 0.0);
+
+    if registry().all().iter().all(|p| !glob_match(pattern, p.path)) {
+        writeln!(out, "no probes matching '{pattern}'. try 'list'")?;
+        return Ok(());
+    }
+
+    let _scope = ProbeScope::enable(pattern);
+    let deadline = (seconds > 0.0).then(|| Instant::now() + Duration::from_secs_f64(seconds));
+    let mut cursor = recorder().last_seq();
+    let mut frames = 0usize;
+
+    loop {
+        std::thread::sleep(interval);
+
+        let events = recorder().since(cursor);
+        for e in &events {
+            cursor = cursor.max(e.seq);
+        }
+        let matching: Vec<Event> = events
+            .into_iter()
+            .filter(|e| glob_match(pattern, registry().path_of(e.probe)))
+            .collect();
+
+        let mut frame = String::new();
+        render_monitor(&matching, &mut frame);
+        let written = out.write_all(frame.as_bytes()).and_then(|_| out.flush());
+        if let Err(e) = written {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                break;
+            }
+            return Err(e);
+        }
+
+        frames += 1;
+        if max_frames > 0 && frames >= max_frames {
+            break;
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn render_monitor(events: &[Event], out: &mut String) {
+    let ts = format_datetime(to_system_time(now_ns()));
+    let _ = writeln!(
+        out,
+        " timestamp            PATH                                       total  success  fail  avg-rt     fail-rate"
+    );
+    let _ = writeln!(
+        out,
+        "-----------------------------------------------------------------------------------------------------------"
+    );
+    let mut rows = aggregate_events(events, "");
+    if rows.is_empty() {
+        let _ = writeln!(out, " {ts:<20} (no calls this interval)");
+        let _ = writeln!(out);
+        return;
+    }
+    rows.sort_by_key(|(_, a)| std::cmp::Reverse(a.total_ns));
+    for (id, a) in rows {
+        let success = a.count.saturating_sub(a.errs);
+        let avg = a.total_ns / a.count.max(1);
+        let fail_rate = if a.count == 0 {
+            0.0
+        } else {
+            a.errs as f64 / a.count as f64 * 100.0
+        };
+        let _ = writeln!(
+            out,
+            " {ts:<20} {:<42} {:>5} {:>8} {:>5} {:>9} {:>9.2}%",
+            truncate(registry().path_of(id), 42),
+            a.count,
+            success,
+            a.errs,
+            format_dur(avg),
+            fail_rate,
+        );
+    }
+    let _ = writeln!(out);
+}
+
+// ---------------------------------------------------------------------------
+// tt: time tunnel
+// ---------------------------------------------------------------------------
+
+fn cmd_tt<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
+    if args.flag("clear") {
+        let n = tunnel().len();
+        tunnel().clear();
+        writeln!(out, "cleared {n} fragment(s)")?;
+        return Ok(());
+    }
+    if args.flag("list") {
+        return cmd_tt_list(args.pattern(), out);
+    }
+    if let Some(raw) = args.get("index") {
+        return cmd_tt_index(raw, out);
+    }
+    if let Some(raw) = args.get("delete") {
+        return cmd_tt_delete(raw, out);
+    }
+    if args.pattern().is_empty() {
+        writeln!(
+            out,
+            "usage: tt <pattern> [--count N] [--seconds F] [--args S] [--ret S]\n\
+             or     tt --list [pattern] | tt --index N | tt --delete N | tt --clear\n\
+             replay (Arthas tt -p) is not supported: rthas stores Debug strings, not typed values"
+        )?;
+        return Ok(());
+    }
+    cmd_tt_record(args, out)
+}
+
+fn cmd_tt_record<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
+    let pattern = args.pattern();
+    let max_count = args.num("count", 0usize);
+    let seconds: f64 = args.num("seconds", 0.0);
+    let args_filter = args.get("args").unwrap_or("");
+    let ret_filter = args.get("ret").unwrap_or("");
+
+    if registry().all().iter().all(|p| !glob_match(pattern, p.path)) {
+        writeln!(out, "no probes matching '{pattern}'. try 'list'")?;
+        return Ok(());
+    }
+
+    let _scope = ProbeScope::enable(pattern);
+    let deadline = (seconds > 0.0).then(|| Instant::now() + Duration::from_secs_f64(seconds));
+    let mut cursor = recorder().last_seq();
+    let mut printed = 0usize;
+
+    writeln!(
+        out,
+        "{:<7} {:<19} {:>10} {:<6} {:>10} {:>10}  PATH",
+        "INDEX", "TIMESTAMP", "COST", "OK", "TID", "TASK"
+    )?;
+
+    loop {
+        for event in recorder().since(cursor) {
+            cursor = cursor.max(event.seq);
+            let path = registry().path_of(event.probe);
+            if !glob_match(pattern, path) {
+                continue;
+            }
+            if !matches_filters(&event, args_filter, ret_filter) {
+                continue;
+            }
+            let index = tunnel().record(&event, path);
+            writeln!(out, "{}", format_tt_row(index, &event, path))?;
+            printed += 1;
+            if max_count > 0 && printed >= max_count {
+                break;
+            }
+        }
+        if max_count > 0 && printed >= max_count {
+            break;
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            break;
+        }
+        out.flush()?;
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    writeln!(
+        out,
+        "\n[{printed} fragment(s) recorded, {} retained, probes restored]\n\
+         next: tt --list   or   tt --index {}",
+        tunnel().len(),
+        if printed > 0 { "N" } else { "(none yet)" },
+    )?;
+    Ok(())
+}
+
+fn format_tt_row(index: u64, event: &Event, path: &str) -> String {
+    format!(
+        "{:<7} {:<19} {:>10} {:<6} {:>10} {:>10}  {}",
+        index,
+        format_datetime(to_system_time(event.start_ns)),
+        format_dur(event.dur_ns),
+        if event.ok { "true" } else { "false" },
+        event.tid,
+        event.task,
+        path,
+    )
+}
+
+fn cmd_tt_list<W: Write>(pattern: &str, out: &mut W) -> std::io::Result<()> {
+    let rows: Vec<_> = tunnel()
+        .list()
+        .into_iter()
+        .filter(|f| glob_match(pattern, &f.path))
+        .collect();
+    if rows.is_empty() {
+        writeln!(
+            out,
+            "no fragments{}. record with `tt <pattern>`, then `tt --list`",
+            if pattern.is_empty() {
+                String::new()
+            } else {
+                format!(" matching '{pattern}'")
+            }
+        )?;
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "{:<7} {:<19} {:>10} {:<6} {:>10} {:>10}  PATH",
+        "INDEX", "TIMESTAMP", "COST", "OK", "TID", "TASK"
+    )?;
+    for f in &rows {
+        writeln!(
+            out,
+            "{:<7} {:<19} {:>10} {:<6} {:>10} {:>10}  {}",
+            f.index,
+            format_datetime(to_system_time(f.start_ns)),
+            format_dur(f.dur_ns),
+            if f.ok { "true" } else { "false" },
+            f.tid,
+            f.task,
+            f.path,
+        )?;
+    }
+    writeln!(out, "\n{} fragment(s)", rows.len())?;
+    Ok(())
+}
+
+fn cmd_tt_index<W: Write>(raw: &str, out: &mut W) -> std::io::Result<()> {
+    let Ok(index) = raw.parse::<u64>() else {
+        writeln!(out, "tt --index needs a number, got '{raw}'")?;
+        return Ok(());
+    };
+    let Some(f) = tunnel().get(index) else {
+        writeln!(out, "no fragment {index}. try 'tt --list'")?;
+        return Ok(());
+    };
+    writeln!(out, " INDEX       {index}")?;
+    writeln!(
+        out,
+        " TIMESTAMP   {}",
+        format_datetime(to_system_time(f.start_ns))
+    )?;
+    writeln!(out, " COST        {}", format_dur(f.dur_ns))?;
+    writeln!(out, " PATH        {}", f.path)?;
+    writeln!(out, " TID         {}", f.tid)?;
+    writeln!(out, " TASK        {}", f.task)?;
+    writeln!(out, " OK          {}", f.ok)?;
+    writeln!(out, " ARGS        {}", empty_dash(&f.args))?;
+    writeln!(out, " RETURN      {}", empty_dash(&f.ret))?;
+    Ok(())
+}
+
+fn cmd_tt_delete<W: Write>(raw: &str, out: &mut W) -> std::io::Result<()> {
+    let Ok(index) = raw.parse::<u64>() else {
+        writeln!(out, "tt --delete needs a number, got '{raw}'")?;
+        return Ok(());
+    };
+    if tunnel().delete(index) {
+        writeln!(out, "deleted fragment {index}")?;
+    } else {
+        writeln!(out, "no fragment {index}")?;
+    }
+    Ok(())
+}
+
+fn empty_dash(s: &str) -> &str {
+    if s.is_empty() {
+        "-"
+    } else {
+        s
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sysenv / memory / session / options / stop
+// ---------------------------------------------------------------------------
+
+fn sysenv_entries(name: &str) -> Vec<(String, String)> {
+    let mut v: Vec<_> = std::env::vars()
+        .filter(|(k, _)| name.is_empty() || k == name)
+        .collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+fn cmd_sysenv<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
+    let name = args.pattern();
+    let rows = sysenv_entries(name);
+    if rows.is_empty() {
+        if name.is_empty() {
+            writeln!(out, "no environment variables")?;
+        } else {
+            writeln!(out, "no env var named '{name}'")?;
+        }
+        return Ok(());
+    }
+    writeln!(out, "{:<28} VALUE", "KEY")?;
+    for (k, v) in &rows {
+        writeln!(out, "{:<28} {}", truncate(k, 28), v)?;
+    }
+    writeln!(out, "\n{} var(s)", rows.len())?;
+    Ok(())
+}
+
+fn cmd_memory<W: Write>(out: &mut W) -> std::io::Result<()> {
+    let m = memory_info();
+    let rss_note = if m.rss_is_peak {
+        "peak (getrusage)"
+    } else {
+        "current"
+    };
+    writeln!(out, "{:<16} {:<12}  NOTE", "METRIC", "VALUE")?;
+    writeln!(
+        out,
+        "{:<16} {:<12}  {rss_note}",
+        "rss",
+        fmt_bytes(m.rss_bytes)
+    )?;
+    if m.virt_bytes > 0 {
+        writeln!(out, "{:<16} {:<12}", "virt", fmt_bytes(m.virt_bytes))?;
+    }
+    if m.peak_rss_bytes > 0 {
+        writeln!(
+            out,
+            "{:<16} {:<12}",
+            "peak_rss",
+            fmt_bytes(m.peak_rss_bytes)
+        )?;
+    }
+    if m.swap_bytes > 0 || !m.rss_is_peak {
+        writeln!(out, "{:<16} {:<12}", "swap", fmt_bytes(m.swap_bytes))?;
+    }
+    writeln!(out, "{:<16} {:<12}", "threads", m.threads)?;
+    if m.fds > 0 {
+        writeln!(
+            out,
+            "{:<16} {} / {}",
+            "fds",
+            m.fds,
+            if m.fd_limit == 0 {
+                "-".to_string()
+            } else {
+                m.fd_limit.to_string()
+            }
+        )?;
+    } else if m.fd_limit > 0 {
+        writeln!(out, "{:<16} (limit {})", "fds", m.fd_limit)?;
+    }
+    Ok(())
+}
+
+fn cmd_session<W: Write>(out: &mut W) -> std::io::Result<()> {
+    let probes = registry();
+    let enabled = probes.all().iter().filter(|p| p.enabled()).count();
+    let (recorded, dropped, _) = recorder().stats();
+    writeln!(out, " {:<12} {}", "Name", "Value")?;
+    writeln!(out, "{}", "-".repeat(50))?;
+    writeln!(out, " {:<12} {}", "PID", std::process::id())?;
+    writeln!(out, " {:<12} {}", "SOCKET", socket_path().display())?;
+    writeln!(
+        out,
+        " {:<12} {} registered, {} enabled",
+        "PROBES",
+        probes.len(),
+        enabled
+    )?;
+    writeln!(
+        out,
+        " {:<12} {} recorded, {} evicted, {} capacity",
+        "RING",
+        recorded,
+        dropped,
+        recorder().capacity()
+    )?;
+    writeln!(
+        out,
+        " {:<12} {} fragment(s), {} capacity",
+        "TUNNEL",
+        tunnel().len(),
+        tunnel().capacity()
+    )?;
+    writeln!(
+        out,
+        " {:<12} {}",
+        "UPTIME",
+        fmt_clock(Duration::from_nanos(now_ns()))
+    )?;
+    Ok(())
+}
+
+fn cmd_options<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
+    let name = args.pos.get(1).copied().unwrap_or("");
+    let value = args.pos.get(2).copied().unwrap_or("");
+    if name.is_empty() {
+        writeln!(
+            out,
+            "{:<12} {:<12} {:<8} SUMMARY",
+            "NAME", "VALUE", "MUTABLE"
+        )?;
+        writeln!(
+            out,
+            "{:<12} {:<12} {:<8} max chars per arg/return value",
+            "max-str",
+            max_str(),
+            "yes"
+        )?;
+        writeln!(
+            out,
+            "{:<12} {:<12} {:<8} display timezone offset in hours",
+            "tz-hours",
+            format_tz_hours(tz_hours()),
+            "yes"
+        )?;
+        writeln!(
+            out,
+            "{:<12} {:<12} {:<8} ring buffer size (set RTHAS_CAPACITY before init)",
+            "capacity",
+            recorder().capacity(),
+            "no"
+        )?;
+        return Ok(());
+    }
+    if value.is_empty() {
+        match name {
+            "max-str" => writeln!(out, "max-str = {}", max_str())?,
+            "tz-hours" => writeln!(out, "tz-hours = {}", format_tz_hours(tz_hours()))?,
+            "capacity" => writeln!(out, "capacity = {} (immutable at runtime)", recorder().capacity())?,
+            other => writeln!(out, "unknown option '{other}'. try 'options'")?,
+        }
+        return Ok(());
+    }
+    match name {
+        "max-str" => match value.parse::<usize>() {
+            Ok(n) if n >= 1 => {
+                set_max_str(n);
+                writeln!(out, "max-str = {}", max_str())?;
+            }
+            _ => writeln!(out, "max-str needs a positive integer, got '{value}'")?,
+        },
+        "tz-hours" => match value.parse::<f64>() {
+            Ok(h) if h.is_finite() => {
+                set_tz_hours(h);
+                writeln!(out, "tz-hours = {}", format_tz_hours(tz_hours()))?;
+            }
+            _ => writeln!(out, "tz-hours needs a number, got '{value}'")?,
+        },
+        "capacity" => writeln!(
+            out,
+            "capacity is fixed after init; restart with RTHAS_CAPACITY={value}"
+        )?,
+        other => writeln!(out, "unknown option '{other}'. try 'options'")?,
+    }
+    Ok(())
+}
+
+fn format_tz_hours(h: f64) -> String {
+    if (h - h.round()).abs() < 1e-9 {
+        format!("{}", h as i64)
+    } else {
+        format!("{h:.2}")
+    }
+}
+
+fn cmd_stop<W: Write>(out: &mut W) -> std::io::Result<()> {
+    registry().disable_all();
+    let pid = std::process::id();
+    writeln!(out, "stopped agent for pid {pid}; all probes disabled")?;
+    writeln!(out, "next: rthas attach {pid}")?;
+    STOP.store(true, Ordering::SeqCst);
+    // Wake the blocking accept() so the listener thread can notice STOP.
+    let _ = UnixStream::connect(socket_path());
+    match spawn_lazy() {
+        Ok(_) => {}
+        Err(e) => writeln!(out, "could not arm deferred attach: {e}")?,
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Formatting helpers
 // ---------------------------------------------------------------------------
 
@@ -943,6 +1484,12 @@ pub fn attach_trigger_path() -> PathBuf {
 /// Returns the socket path that *will* be used, so callers can log it up front.
 pub fn spawn_lazy() -> std::io::Result<PathBuf> {
     let path = socket_path();
+    if LAZY_WATCHING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(path);
+    }
     let trigger = attach_trigger_path();
     if let Some(dir) = trigger.parent() {
         if !dir.as_os_str().is_empty() {
@@ -951,7 +1498,7 @@ pub fn spawn_lazy() -> std::io::Result<PathBuf> {
     }
 
     let announced = path.clone();
-    std::thread::Builder::new()
+    let spawn_result = std::thread::Builder::new()
         .name("rthas-attach".to_string())
         .spawn(move || loop {
             if !trigger.exists() {
@@ -962,6 +1509,7 @@ pub fn spawn_lazy() -> std::io::Result<PathBuf> {
             let _ = std::fs::remove_file(&trigger);
             match spawn() {
                 Ok(p) => {
+                    LAZY_WATCHING.store(false, Ordering::SeqCst);
                     eprintln!("[rthas] agent started on attach: {}", p.display());
                     return;
                 }
@@ -970,7 +1518,11 @@ pub fn spawn_lazy() -> std::io::Result<PathBuf> {
                     announced.display()
                 ),
             }
-        })?;
+        });
+    if let Err(e) = spawn_result {
+        LAZY_WATCHING.store(false, Ordering::SeqCst);
+        return Err(e);
+    }
     Ok(path)
 }
 
@@ -983,6 +1535,9 @@ pub fn spawn_lazy() -> std::io::Result<PathBuf> {
 /// Call once from `main`. Silently ignores bind failures — a missing control
 /// socket is never a reason to take down the service being debugged.
 pub fn init() {
+    // Anchor the display clock so `session` uptime is time since init, not
+    // since the first command that happened to call `now_ns`.
+    let _ = now_ns();
     match std::env::var("RTHAS_AGENT").as_deref() {
         Ok("0") => {}
         Ok("lazy") => match spawn_lazy() {
@@ -1003,6 +1558,7 @@ pub fn init() {
 /// Defer the agent regardless of `RTHAS_AGENT`, for callers that want the
 /// decision made in code rather than in the environment.
 pub fn init_lazy() {
+    let _ = now_ns();
     match spawn_lazy() {
         Ok(path) => eprintln!(
             "[rthas] agent deferred for pid {} — will bind {} on attach",
@@ -1015,7 +1571,7 @@ pub fn init_lazy() {
 
 #[cfg(test)]
 mod tests {
-    use super::{matches_filters, Args};
+    use super::{matches_filters, sysenv_entries, Args};
     use crate::event::Event;
 
     #[test]
@@ -1034,6 +1590,29 @@ mod tests {
         assert!(a.flag("native"));
         assert_eq!(a.get("count"), Some("2"));
         assert_eq!(a.pos, vec!["stack", "read_block"]);
+    }
+
+    #[test]
+    fn valueless_list_does_not_swallow_the_pattern() {
+        let a = Args::parse("tt --list handle_request");
+        assert!(a.flag("list"));
+        assert_eq!(a.pattern(), "handle_request");
+        assert_eq!(a.get("list"), Some(""));
+    }
+
+    #[test]
+    fn index_flag_still_takes_a_value() {
+        let a = Args::parse("tt --index 1003");
+        assert_eq!(a.get("index"), Some("1003"));
+        assert!(a.pattern().is_empty());
+    }
+
+    #[test]
+    fn sysenv_filters_by_exact_name() {
+        let rows = sysenv_entries("PATH");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "PATH");
+        assert!(sysenv_entries("RTHAS_NO_SUCH_VAR_XYZ").is_empty());
     }
 
     #[test]
