@@ -29,6 +29,7 @@
 //! - [`trace`] — call trees with per-node duration, arguments and return value
 //! - `watch`   — one line per matching call, filterable on args/return
 //! - `stats` / `top` — p50/p95/p99/max over a rolling ring buffer
+//! - `profiler` — CPU sampling (SIGPROF) to a text tree, collapsed stacks, or SVG
 //! - all of it **off by default**: a disabled probe costs one relaxed atomic
 //!   load, and argument formatting is behind a closure so it never runs
 //!
@@ -59,6 +60,7 @@
 mod agent;
 mod event;
 mod probe;
+mod profiler;
 mod sample;
 mod span;
 mod time;

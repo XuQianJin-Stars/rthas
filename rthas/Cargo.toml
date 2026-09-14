@@ -23,4 +23,7 @@ inventory = "0.3"
 # portable std API, and /proc only exists on Linux. Everything else in the crate
 # is pure std, and this stays off the probe hot path.
 libc = "0.2"
+# CPU sampling for `profiler`. Off until `profiler start`; the probe hot path
+# never touches it. `flamegraph` writes SVG the way Arthas dumps HTML.
+pprof = { version = "0.14", default-features = false, features = ["flamegraph"] }
 tokio = { version = "1", default-features = false, features = ["rt"], optional = true }

@@ -93,6 +93,10 @@ PROCESS:
                                     Ctrl-C (--interval F, --count N, --n N)
     thread [opts]                   per-thread CPU and last recorded span
                                     (--n N, --by tid|cpu|name)
+    profiler [start|stop|status]    CPU sampling (SIGPROF)
+                                    (--seconds F, --hz N,
+                                    --format text|collapsed|flamegraph,
+                                    --file PATH, --full)
     memory                          OS memory: rss / virt / threads / fds
     sysenv [NAME]                   process environment (read-only)
     session                         pid, socket, probes, ring, tunnel
@@ -111,6 +115,7 @@ EXAMPLES:
     rthas stack read_block --native --count 2
     rthas dashboard --interval 0.5
     rthas thread --by cpu --n 5
+    rthas profiler --seconds 5
     rthas top --n 5 --by max
     rthas monitor handle_request --interval 1 --count 3
     rthas tt handle_request --count 5
@@ -168,7 +173,7 @@ fn main() {
             }
         },
         "shell" => cmd_shell(&argv[1..]),
-        cmd @ ("list" | "trace" | "watch" | "stack" | "dashboard" | "thread" | "stats" | "top"
+        cmd @ ("list" | "trace" | "watch" | "stack" | "dashboard" | "thread" | "profiler" | "stats" | "top"
         | "on" | "off" | "clear" | "ping" | "monitor" | "tt" | "sysenv" | "memory" | "version"
         | "session" | "options" | "stop" | "reset") => {
             if let Err(e) = cmd_remote(cmd, &argv[1..]) {

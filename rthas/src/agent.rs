@@ -52,7 +52,7 @@ static STOP: AtomicBool = AtomicBool::new(false);
 static LAZY_WATCHING: AtomicBool = AtomicBool::new(false);
 
 /// Flags that never consume the next token (`--native --count 5`).
-const VALUELESS_FLAGS: &[&str] = &["native", "list", "clear"];
+const VALUELESS_FLAGS: &[&str] = &["native", "list", "clear", "full"];
 
 /// Where this process's control socket lives.
 ///
@@ -202,7 +202,12 @@ fn dispatch<W: Write>(line: &str, out: &mut W) -> std::io::Result<bool> {
             out.write_all(HELP.as_bytes())?;
         }
         "ping" => {
-            writeln!(out, "pong pid={} probes={}", std::process::id(), registry().len())?;
+            writeln!(
+                out,
+                "pong pid={} probes={}",
+                std::process::id(),
+                registry().len()
+            )?;
         }
         "list" => cmd_list(&args, out)?,
         "on" => {
@@ -223,6 +228,7 @@ fn dispatch<W: Write>(line: &str, out: &mut W) -> std::io::Result<bool> {
         "stack" => cmd_stack(&args, out)?,
         "dashboard" => cmd_dashboard(&args, out)?,
         "thread" => cmd_thread(&args, out)?,
+        "profiler" => cmd_profiler(&args, out)?,
         "stats" => cmd_stats(&args, out)?,
         "top" => cmd_top(&args, out)?,
         "monitor" => cmd_monitor(&args, out)?,
@@ -280,6 +286,17 @@ rthas control commands
   thread [opts]                         per-thread CPU and last recorded span
      --n N            show only the top N threads by CPU
      --by tid|cpu|name                  sort order (default tid)
+  profiler [action] [opts]              CPU sampling (Arthas profiler)
+     start            install SIGPROF sampler (default 99 Hz)
+     stop             dump the report and uninstall
+     status           whether a session is running
+     getSamples       sample count of the current session
+     --seconds F      one-shot: start, wait F seconds, stop
+     --hz N           sample rate (1–1000, default 99)
+     --format text|collapsed|flamegraph   stop output (default text)
+     --file PATH      also write the report to PATH
+     --n N / --depth N   hottest frames / tree depth
+     --full           keep tokio/std/pthread frames in the text tree
   stats [pattern]                       p50/p95/p99/max over the ring buffer
   top [pattern] [--n N] [--by total|max|count]   slowest / hottest functions
   monitor [pattern] [opts]              periodic method stats (Arthas monitor)
@@ -401,7 +418,11 @@ fn cmd_trace<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
     let depth = args.num("depth", 0usize);
     let min_ns = (args.num("min-ms", 0.0f64) * 1_000_000.0) as u64;
 
-    if registry().all().iter().all(|p| !glob_match(pattern, p.path)) {
+    if registry()
+        .all()
+        .iter()
+        .all(|p| !glob_match(pattern, p.path))
+    {
         writeln!(out, "no probes matching '{pattern}'. try 'list'")?;
         return Ok(());
     }
@@ -468,7 +489,10 @@ fn cmd_trace<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
             out.write_all(render(&tree, &opts).as_bytes())?;
         }
     }
-    writeln!(out, "\n[{printed} call tree(s), probes restored to previous state]")?;
+    writeln!(
+        out,
+        "\n[{printed} call tree(s), probes restored to previous state]"
+    )?;
     Ok(())
 }
 
@@ -479,7 +503,11 @@ fn cmd_watch<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
     let args_filter = args.get("args").unwrap_or("");
     let ret_filter = args.get("ret").unwrap_or("");
 
-    if registry().all().iter().all(|p| !glob_match(pattern, p.path)) {
+    if registry()
+        .all()
+        .iter()
+        .all(|p| !glob_match(pattern, p.path))
+    {
         writeln!(out, "no probes matching '{pattern}'. try 'list'")?;
         return Ok(());
     }
@@ -930,6 +958,171 @@ fn cmd_thread<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// profiler: SIGPROF sampling (Arthas profiler)
+// ---------------------------------------------------------------------------
+
+fn cmd_profiler<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
+    let action = args.pos.get(1).copied().unwrap_or("");
+    let seconds: f64 = args.num("seconds", 0.0);
+    let hz = args.num("hz", crate::profiler::default_hz());
+    let format = args.get("format").unwrap_or("text");
+    let file = args.get("file").unwrap_or("");
+    let top_n = args.num("n", 15usize);
+    let depth = args.num("depth", 24usize);
+    let full = args.flag("full");
+
+    if let Some(event) = args.get("event") {
+        if !event.is_empty() && event != "cpu" {
+            writeln!(out, "only --event cpu is supported; ignoring '{event}'")?;
+        }
+    }
+
+    if seconds > 0.0 && matches!(action, "" | "start") {
+        return profiler_oneshot(seconds, hz, format, file, top_n, depth, full, out);
+    }
+
+    match action {
+        "" => {
+            writeln!(out, "{}", crate::profiler::status_line())?;
+            if !crate::profiler::is_running() {
+                writeln!(
+                    out,
+                    "try: profiler start | profiler --seconds 5 | profiler stop"
+                )?;
+            }
+            Ok(())
+        }
+        "start" => match crate::profiler::start(hz) {
+            Ok(()) => writeln!(
+                out,
+                "Started [cpu] profiling at {} Hz",
+                crate::profiler::clamp_hz(hz)
+            ),
+            Err(e) => writeln!(out, "{e}"),
+        },
+        "stop" => profiler_dump(format, file, top_n, depth, full, out),
+        "status" => writeln!(out, "{}", crate::profiler::status_line()),
+        "getSamples" | "getsamples" | "get-samples" | "samples" => {
+            match crate::profiler::sample_count() {
+                Ok(n) => writeln!(out, "{n}"),
+                Err(e) => writeln!(out, "{e}"),
+            }
+        }
+        other => writeln!(
+            out,
+            "unknown profiler action '{other}'. try start|stop|status|getSamples"
+        ),
+    }
+}
+
+fn profiler_oneshot<W: Write>(
+    seconds: f64,
+    hz: i32,
+    format: &str,
+    file: &str,
+    top_n: usize,
+    depth: usize,
+    full: bool,
+    out: &mut W,
+) -> std::io::Result<()> {
+    if crate::profiler::is_running() {
+        writeln!(out, "profiler is already running; `profiler stop` first")?;
+        return Ok(());
+    }
+    if let Err(e) = crate::profiler::start(hz) {
+        writeln!(out, "{e}")?;
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "Started [cpu] profiling at {} Hz for {seconds:.1}s",
+        crate::profiler::clamp_hz(hz)
+    )?;
+    let _ = out.flush();
+    std::thread::sleep(Duration::from_secs_f64(seconds.max(0.05)));
+    profiler_dump(format, file, top_n, depth, full, out)
+}
+
+fn profiler_dump<W: Write>(
+    format: &str,
+    file: &str,
+    top_n: usize,
+    depth: usize,
+    full: bool,
+    out: &mut W,
+) -> std::io::Result<()> {
+    let snap = match crate::profiler::stop() {
+        Ok(s) => s,
+        Err(e) => {
+            writeln!(out, "{e}")?;
+            return Ok(());
+        }
+    };
+    writeln!(
+        out,
+        "Stopped [cpu] profiling. samples={} elapsed={:.1}s hz={}",
+        snap.total(),
+        snap.elapsed.as_secs_f64(),
+        snap.hz
+    )?;
+    if snap.raw_samples > 0 && snap.total() == 0 {
+        writeln!(
+            out,
+            "({} raw sample(s) dropped — frames were in filtered libc/pprof code)",
+            snap.raw_samples
+        )?;
+    }
+
+    let kind = match format {
+        "collapsed" | "folded" => "collapsed",
+        "flamegraph" | "svg" | "html" => "flamegraph",
+        _ => "text",
+    };
+
+    if kind == "flamegraph" {
+        let path = if file.is_empty() {
+            std::env::temp_dir().join(format!("rthas-{}.svg", std::process::id()))
+        } else {
+            std::path::PathBuf::from(file)
+        };
+        match std::fs::File::create(&path) {
+            Ok(f) => match snap.write_flamegraph(f) {
+                Ok(()) => writeln!(out, "wrote {} (flamegraph svg)", path.display())?,
+                Err(e) => writeln!(out, "{e}")?,
+            },
+            Err(e) => writeln!(out, "could not create {}: {e}", path.display())?,
+        }
+        // A few hot frames so the terminal is not only a path.
+        let text = snap.render_text(4, 8, !full);
+        write_profiler_body(out, &text)?;
+        return Ok(());
+    }
+
+    let body = if kind == "collapsed" {
+        snap.render_collapsed()
+    } else {
+        snap.render_text(depth, top_n, !full)
+    };
+    write_profiler_body(out, &body)?;
+
+    if !file.is_empty() {
+        match std::fs::write(file, &body) {
+            Ok(()) => writeln!(out, "wrote {file}")?,
+            Err(e) => writeln!(out, "could not write {file}: {e}")?,
+        }
+    }
+    Ok(())
+}
+
+fn write_profiler_body<W: Write>(out: &mut W, body: &str) -> std::io::Result<()> {
+    match out.write_all(body.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // monitor: Arthas-style periodic method stats
 // ---------------------------------------------------------------------------
 
@@ -939,7 +1132,11 @@ fn cmd_monitor<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
     let max_frames = args.num("count", 0usize);
     let seconds: f64 = args.num("seconds", 0.0);
 
-    if registry().all().iter().all(|p| !glob_match(pattern, p.path)) {
+    if registry()
+        .all()
+        .iter()
+        .all(|p| !glob_match(pattern, p.path))
+    {
         writeln!(out, "no probes matching '{pattern}'. try 'list'")?;
         return Ok(());
     }
@@ -1060,7 +1257,11 @@ fn cmd_tt_record<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
     let args_filter = args.get("args").unwrap_or("");
     let ret_filter = args.get("ret").unwrap_or("");
 
-    if registry().all().iter().all(|p| !glob_match(pattern, p.path)) {
+    if registry()
+        .all()
+        .iter()
+        .all(|p| !glob_match(pattern, p.path))
+    {
         writeln!(out, "no probes matching '{pattern}'. try 'list'")?;
         return Ok(());
     }
@@ -1325,6 +1526,12 @@ fn cmd_session<W: Write>(out: &mut W) -> std::io::Result<()> {
         "UPTIME",
         fmt_clock(Duration::from_nanos(now_ns()))
     )?;
+    writeln!(
+        out,
+        " {:<12} {}",
+        "PROFILER",
+        crate::profiler::status_line()
+    )?;
     Ok(())
 }
 
@@ -1364,7 +1571,11 @@ fn cmd_options<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
         match name {
             "max-str" => writeln!(out, "max-str = {}", max_str())?,
             "tz-hours" => writeln!(out, "tz-hours = {}", format_tz_hours(tz_hours()))?,
-            "capacity" => writeln!(out, "capacity = {} (immutable at runtime)", recorder().capacity())?,
+            "capacity" => writeln!(
+                out,
+                "capacity = {} (immutable at runtime)",
+                recorder().capacity()
+            )?,
             other => writeln!(out, "unknown option '{other}'. try 'options'")?,
         }
         return Ok(());
@@ -1441,7 +1652,12 @@ fn fmt_bytes(bytes: u64) -> String {
 /// `HH:MM:SS` from a duration, for the uptime column.
 fn fmt_clock(d: Duration) -> String {
     let secs = d.as_secs();
-    format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
 }
 
 fn truncate(s: &str, max: usize) -> &str {

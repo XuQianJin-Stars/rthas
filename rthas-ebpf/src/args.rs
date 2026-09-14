@@ -75,7 +75,7 @@ rthas eBPF attach (uninstrumented process)
   ping / help
 
 No Debug args/return values. Async call trees are not reliable.
-stack/tt/monitor/stats/dashboard/memory are not available on eBPF attach.
+stack/tt/monitor/stats/dashboard/memory/profiler are not available on eBPF attach.
 ";
 
 pub fn handle_client<F>(stream: UnixStream, mut dispatch: F) -> std::io::Result<()>

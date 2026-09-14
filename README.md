@@ -1,7 +1,7 @@
 # rthas
 
 > **Arthas-flavoured runtime probe toolkit for Rust**  
-> `trace` / `watch` / `stack` / `stats` / `top` / `dashboard` / `thread` / `attach --ebpf` — without a debugger.
+> `trace` / `watch` / `stack` / `stats` / `top` / `dashboard` / `thread` / `profiler` / `attach --ebpf` — without a debugger.
 
 Java gets [Arthas](https://github.com/alibaba/arthas) because the JVM can rewrite bytecode at runtime (Instrumentation), attach to a live process (Attach API), and redefine classes on the fly (JVMTI). Rust is ahead-of-time compiled to machine code with no VM layer, so those tricks are simply unavailable.
 
@@ -24,6 +24,7 @@ Java gets [Arthas](https://github.com/alibaba/arthas) because the JVM can rewrit
 | `tt` time tunnel | bytecode + object refs | indexed `Debug` snapshots | ✅ | ✅ record / list / inspect (no replay) |
 | `sysenv` / `memory` / `session` / `options` / `version` / `stop` | JMX / agent | process env, OS memory, runtime knobs | ✅ | ✅ implemented |
 | Restart-free attach to an **instrumented** process | Attach API | trigger file wakes a deferred agent | ✅ | ✅ implemented |
+| `profiler` flame graph | async-profiler | SIGPROF sampling (`pprof`) | ✅ | ✅ start / stop / status (cpu; text + collapsed + svg) |
 | Restart-free attach to an **un-instrumented** process | Attach API | eBPF uprobe only (Linux + root + symbols) | ⚠️ | ✅ `attach --ebpf` (name + latency; no Debug args) |
 | `jad` decompile / `redefine` hot swap | runtime class redefinition | impossible (machine code is not rewritable) | ❌ | — |
 
@@ -109,6 +110,9 @@ cargo run --bin rthas -- dashboard --interval 1
 # Per-thread CPU and what each thread last did
 cargo run --bin rthas -- thread --by cpu --n 5
 
+# CPU sample for a few seconds (text tree; --format flamegraph writes SVG)
+cargo run --bin rthas -- profiler --seconds 5
+
 # Periodic method stats (enables probes for the duration)
 cargo run --bin rthas -- monitor handle_request --interval 1 --count 3
 
@@ -141,9 +145,10 @@ cargo run --bin rthas -- shell
 | `tt --list [pattern]` / `tt --index N` / `tt --delete N` / `tt --clear` | List / inspect / drop fragments (no `tt -p` replay) |
 | `dashboard [--interval F] [--count N] [--n N]` | Live process overview, refreshes until Ctrl-C |
 | `thread [--n N] [--by tid\|cpu\|name]` | Per-thread CPU plus last recorded span |
+| `profiler start\|stop\|status` | CPU sampling (SIGPROF). `--seconds F` one-shot; `--format text\|collapsed\|flamegraph` |
 | `memory` | OS memory: rss / virt / threads / fds |
 | `sysenv [NAME]` | Process environment (read-only) |
-| `session` | pid, socket, probes, ring, tunnel |
+| `session` | pid, socket, probes, ring, tunnel, profiler |
 | `options [name] [value]` | List or set runtime knobs (`max-str`, `tz-hours`) |
 | `version` | rthas library version in the target process |
 | `reset` | Disable all probes |
@@ -168,6 +173,21 @@ Patterns use shell-style globbing: `*` is wildcard, no-`*` matches by substring.
 ```
 
 `CPU` / `MEM` / `load1` / `threads` are read straight from the OS by `sample.rs`, with no JVM-like middle layer in between; the lower half aggregates the ring buffer incrementally per refresh interval. For Arthas-style method stats on their own (and to enable matching probes automatically), use `monitor`.
+
+### `profiler` output
+
+```text
+$ rthas profiler --seconds 3
+Started [cpu] profiling at 99 Hz for 3.0s
+Stopped [cpu] profiling. samples=280 elapsed=3.0s hz=99
+── rthas profiler ── 3.0s ── 99 Hz ── 280 samples ──
+  SHARE  SAMPLES  STACK
+  100.0%     280  example_app::handle_request
+   48.2%     135    example_app::crunch
+   21.4%      60    example_app::lookup_metadata
+```
+
+Sampling uses SIGPROF (`pprof`); nothing is installed until `profiler start` or `--seconds`. The text tree omits tokio / std / pthread frames so your functions surface (`--full` keeps them). `--format collapsed` is input for speedscope / `flamegraph.pl`; `--format flamegraph` writes an SVG (`--file` or `/tmp/rthas-<pid>.svg`). This is a **native** stack sample — async work shows up as `poll`, not as the logical request. Use `trace` for that. Not available on `attach --ebpf`. ITIMER_PROF only ticks while the process is on CPU; a service that is mostly `.await`ing looks idle.
 
 Platform differences: `/proc` gives exact per-thread CPU deltas (Linux), while Mach only reports an instantaneous occupancy ratio (macOS), and on macOS the RSS figure is the `getrusage` peak rather than the current value. `--by cpu` is therefore an instantaneous reading on macOS; every other field is identical.
 
@@ -294,6 +314,7 @@ A disabled probe has **zero allocation** and is always branch-predicted taken. A
 │  │  probe.rs     — static sites + registry │ │
 │  │  span.rs      — thread-local stack      │ │
 │  │  sample.rs    — OS metrics: /proc, Mach │ │
+│  │  profiler.rs  — SIGPROF CPU sampling    │ │
 │  │  time.rs      — monotonic + wall-clock  │ │
 │  └──────────────────────────────────────────┘ │
 │  ┌─ rthas-ebpf (Linux helper) ────────────┐ │

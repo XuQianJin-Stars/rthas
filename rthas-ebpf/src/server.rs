@@ -128,7 +128,7 @@ mod linux {
                 return Ok(false);
             }
             "stack" | "tt" | "monitor" | "stats" | "top" | "dashboard" | "thread" | "memory"
-            | "sysenv" | "session" | "options" | "reset" | "clear" | "version" => {
+            | "sysenv" | "session" | "options" | "reset" | "clear" | "version" | "profiler" => {
                 writeln!(out, "{verb} is not available on eBPF attach")?;
             }
             other => writeln!(out, "unknown command '{other}'. try 'help'")?,

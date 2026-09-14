@@ -112,6 +112,7 @@ static CACHE: LazyLock<Cache> = LazyLock::new(Cache::new);
 /// with `<early-return>` as its value, so failures are never silently lost.
 #[rthas::trace(send)]
 async fn handle_request(id: u64, path: &str) -> Result<u64, AppError> {
+    let _ = crunch(id);
     if !AUTH.authorize("alice", "s3cret") {
         return Err(AppError::NotFound(path.to_string()));
     }
@@ -156,6 +157,19 @@ fn checksum(bytes: &[u8]) -> u64 {
     bytes.iter().map(|b| u64::from(*b)).sum()
 }
 
+/// Busy-loop so `rthas profiler` has CPU time to sample. The rest of the
+/// request path is mostly `tokio::sleep`, which never decrements ITIMER_PROF.
+#[rthas::trace]
+fn crunch(seed: u64) -> u64 {
+    let until = std::time::Instant::now() + Duration::from_millis(8);
+    let mut x = seed | 1;
+    while std::time::Instant::now() < until {
+        x = x.wrapping_mul(0x5bd1e995).wrapping_add(x >> 3);
+        std::hint::black_box(x);
+    }
+    x
+}
+
 fn hash(s: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in s.as_bytes() {
@@ -184,6 +198,7 @@ async fn main() {
     eprintln!("  cargo run --bin rthas -- trace handle_request --count 3");
     eprintln!("  cargo run --bin rthas -- watch read_block --ret Err --count 5");
     eprintln!("  cargo run --bin rthas -- top --n 5 --by max");
+    eprintln!("  cargo run --bin rthas -- profiler --seconds 5");
 
     let mut id: u64 = 0;
     loop {
