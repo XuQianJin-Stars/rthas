@@ -23,6 +23,7 @@ Java gets [Arthas](https://github.com/alibaba/arthas) because the JVM can rewrit
 | `monitor` periodic stats | bytecode instrumentation | ring buffer aggregated per interval | ✅ | ✅ implemented (also in `dashboard`) |
 | `tt` time tunnel | bytecode + object refs | indexed `Debug` snapshots | ✅ | ✅ record / list / inspect (no replay) |
 | `sysenv` / `memory` / `session` / `options` / `version` / `stop` | JMX / agent | process env, OS memory, runtime knobs | ✅ | ✅ implemented |
+| `auth` + pipes (`grep` / `tee` / `wc`) / `pwd` / `cat` | telnet session | `RTHAS_PASSWORD` per connection; in-process pipes | ✅ | ✅ implemented |
 | Restart-free attach to an **instrumented** process | Attach API | trigger file wakes a deferred agent | ✅ | ✅ implemented |
 | `profiler` flame graph | async-profiler | SIGPROF sampling (`pprof`) | ✅ | ✅ start / stop / status (cpu; text + collapsed + svg) |
 | Restart-free attach to an **un-instrumented** process | Attach API | eBPF uprobe only (Linux + root + symbols) | ⚠️ | ✅ `attach --ebpf` (name + latency; no Debug args) |
@@ -123,6 +124,8 @@ cargo run --bin rthas -- tt --index 1000
 
 # Interactive session
 cargo run --bin rthas -- shell
+#   rthas> list | grep handle
+#   rthas> sysenv | grep -i path | wc
 ```
 
 ## Commands
@@ -148,8 +151,12 @@ cargo run --bin rthas -- shell
 | `profiler start\|stop\|status` | CPU sampling (SIGPROF). `--seconds F` one-shot; `--format text\|collapsed\|flamegraph` |
 | `memory` | OS memory: rss / virt / threads / fds |
 | `sysenv [NAME]` | Process environment (read-only) |
-| `session` | pid, socket, probes, ring, tunnel, profiler |
+| `session` | pid, socket, probes, ring, tunnel, profiler, auth |
 | `options [name] [value]` | List or set runtime knobs (`max-str`, `tz-hours`) |
+| `auth [password]` | Authenticate this connection when `RTHAS_PASSWORD` is set |
+| `pwd` / `cat PATH` / `echo ...` | Process working directory and files (cat capped at 2 MiB) |
+| `<cmd> \| grep PATTERN` | Pipe: `-i -v -n -c -m N -A N -B N -C N` (substring; no regex) |
+| `<cmd> \| tee [-a] FILE` / `<cmd> \| wc` | Copy output to a file / count lines |
 | `version` | rthas library version in the target process |
 | `reset` | Disable all probes |
 | `stop` | Unbind the agent; `rthas attach <pid>` restarts it |
@@ -312,6 +319,7 @@ A disabled probe has **zero allocation** and is always branch-predicted taken. A
 │  │  agent.rs     — control-plane thread    │ │
 │  │  event.rs     — bounded FIFO (16K)      │ │
 │  │  tunnel.rs    — indexed tt fragments    │ │
+│  │  pipe.rs      — grep / tee / wc pipes   │ │
 │  │  tree.rs      — forest → render         │ │
 │  │  probe.rs     — static sites + registry │ │
 │  │  span.rs      — thread-local stack      │ │
@@ -341,6 +349,8 @@ A disabled probe has **zero allocation** and is always branch-predicted taken. A
 | `RTHAS_TT_CAPACITY` | `100` | Time-tunnel fragments retained |
 | `RTHAS_MAX_STR` | `256` | Max chars per arg/return value (`options max-str` can change this later) |
 | `RTHAS_TZ_HOURS` | `0` (UTC) | Display timezone offset (`options tz-hours` can change this later) |
+| `RTHAS_PASSWORD` | unset (off) | If set, each connection must `auth` (or CLI `--password`) |
+| `RTHAS_USERNAME` | `rthas` | Username checked by `auth --username` |
 | `RTHAS_MACRO_DEBUG` | off | Print macro expansion to stderr |
 | `RTHAS_DEBUG` | off | Log every event the agent ingests to stderr |
 

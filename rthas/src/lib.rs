@@ -59,6 +59,7 @@
 
 mod agent;
 mod event;
+mod pipe;
 mod probe;
 mod profiler;
 mod sample;

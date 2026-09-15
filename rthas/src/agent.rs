@@ -110,6 +110,8 @@ fn handle_client(stream: UnixStream) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = BufWriter::new(stream);
     let mut line = String::new();
+    let need_auth = password_configured();
+    let mut authed = !need_auth;
     loop {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
@@ -119,10 +121,7 @@ fn handle_client(stream: UnixStream) -> std::io::Result<()> {
         if cmd.is_empty() {
             continue;
         }
-        let keep_open = dispatch(cmd, &mut writer)?;
-        // The connection stays open for the next command, so EOF cannot mark
-        // the end of a reply. The sentinel does, and it is cheap enough that
-        // `nc` users can just ignore it.
+        let keep_open = dispatch(cmd, &mut writer, &mut authed)?;
         writeln!(writer, "{END}")?;
         writer.flush()?;
         if !keep_open {
@@ -193,7 +192,65 @@ impl<'a> Args<'a> {
 // Dispatch
 // ---------------------------------------------------------------------------
 
-fn dispatch<W: Write>(line: &str, out: &mut W) -> std::io::Result<bool> {
+fn dispatch<W: Write>(line: &str, out: &mut W, authed: &mut bool) -> std::io::Result<bool> {
+    let (cmd, pipes) = crate::pipe::split_pipeline(line);
+    let verb = cmd.split_whitespace().next().unwrap_or("");
+    if password_configured() && !*authed && !auth_free(verb) {
+        writeln!(
+            out,
+            "command not permitted, try to use 'auth' command to authenticates."
+        )?;
+        return Ok(true);
+    }
+    if pipes.is_empty() {
+        return dispatch_verb(&cmd, out, authed);
+    }
+    let mut pipe = match crate::pipe::Pipeline::new(&mut *out, &pipes) {
+        Ok(p) => p,
+        Err(e) => {
+            writeln!(out, "{e}")?;
+            return Ok(true);
+        }
+    };
+    let keep = dispatch_verb(&cmd, &mut pipe, authed)?;
+    pipe.finish()?;
+    Ok(keep)
+}
+
+fn auth_free(verb: &str) -> bool {
+    matches!(verb, "auth" | "help" | "?" | "ping" | "quit" | "exit" | "q")
+}
+
+fn password_configured() -> bool {
+    std::env::var("RTHAS_PASSWORD")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+}
+
+fn expected_username() -> String {
+    std::env::var("RTHAS_USERNAME").unwrap_or_else(|_| "rthas".to_string())
+}
+
+fn expected_password() -> Option<String> {
+    std::env::var("RTHAS_PASSWORD")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+fn secrets_match(a: &str, b: &str) -> bool {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    let max = ab.len().max(bb.len());
+    let mut diff = ab.len() ^ bb.len();
+    for i in 0..max {
+        let x = *ab.get(i).unwrap_or(&0);
+        let y = *bb.get(i).unwrap_or(&0);
+        diff |= (x ^ y) as usize;
+    }
+    diff == 0
+}
+
+fn dispatch_verb<W: Write>(line: &str, out: &mut W, authed: &mut bool) -> std::io::Result<bool> {
     let args = Args::parse(line);
     let verb = args.pos.first().copied().unwrap_or("");
 
@@ -207,6 +264,16 @@ fn dispatch<W: Write>(line: &str, out: &mut W) -> std::io::Result<bool> {
                 "pong pid={} probes={}",
                 std::process::id(),
                 registry().len()
+            )?;
+        }
+        "auth" => cmd_auth(&args, out, authed)?,
+        "pwd" => cmd_pwd(out)?,
+        "cat" => cmd_cat(&args, out)?,
+        "echo" => cmd_echo(&args, out)?,
+        "grep" | "tee" | "wc" => {
+            writeln!(
+                out,
+                "{verb} is a pipe. try: <command> | {verb} ..."
             )?;
         }
         "list" => cmd_list(&args, out)?,
@@ -236,7 +303,7 @@ fn dispatch<W: Write>(line: &str, out: &mut W) -> std::io::Result<bool> {
         "sysenv" => cmd_sysenv(&args, out)?,
         "memory" => cmd_memory(out)?,
         "version" => writeln!(out, "rthas {}", env!("CARGO_PKG_VERSION"))?,
-        "session" => cmd_session(out)?,
+        "session" => cmd_session(out, *authed)?,
         "options" => cmd_options(&args, out)?,
         "reset" => {
             registry().disable_all();
@@ -321,6 +388,9 @@ rthas control commands
   version                               rthas library version in this process
   session                               pid, socket, probes, ring, tunnel
   options [name] [value]                list or set runtime knobs
+  auth [password]                       authenticate this connection (RTHAS_PASSWORD)
+  pwd / cat PATH / echo ...             process cwd and files
+  <cmd> | grep PATTERN | tee FILE | wc  pipes (-i -v -n -c -m -A -B -C; tee -a)
   reset                                 disable all probes (Arthas reset)
   stop                                  unbind the agent; `rthas attach` restarts it
   clear                                 drop buffered events
@@ -1557,7 +1627,75 @@ fn cmd_memory<W: Write>(out: &mut W) -> std::io::Result<()> {
     Ok(())
 }
 
-fn cmd_session<W: Write>(out: &mut W) -> std::io::Result<()> {
+fn cmd_auth<W: Write>(args: &Args, out: &mut W, authed: &mut bool) -> std::io::Result<()> {
+    let Some(want_pass) = expected_password() else {
+        *authed = true;
+        writeln!(out, "Authentication result: true (auth is not configured)")?;
+        return Ok(());
+    };
+    let user = args
+        .get("username")
+        .or_else(|| args.get("user"))
+        .unwrap_or("");
+    let user = if user.is_empty() { "rthas" } else { user };
+    let pass = args
+        .get("password")
+        .filter(|s| !s.is_empty())
+        .or_else(|| args.pos.get(1).copied())
+        .unwrap_or("");
+    let ok = secrets_match(user, &expected_username()) && secrets_match(pass, &want_pass);
+    *authed = ok;
+    writeln!(out, "Authentication result: {ok}")?;
+    Ok(())
+}
+
+fn cmd_pwd<W: Write>(out: &mut W) -> std::io::Result<()> {
+    match std::env::current_dir() {
+        Ok(p) => writeln!(out, "{}", p.display()),
+        Err(e) => writeln!(out, "pwd: {e}"),
+    }
+}
+
+const CAT_MAX: u64 = 2 * 1024 * 1024;
+
+fn cmd_cat<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
+    let path = args.pos.get(1).copied().unwrap_or("");
+    if path.is_empty() {
+        writeln!(out, "cat needs a path")?;
+        return Ok(());
+    }
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) => {
+            writeln!(out, "cat {path}: {e}")?;
+            return Ok(());
+        }
+    };
+    if !meta.is_file() {
+        writeln!(out, "cat {path}: not a regular file")?;
+        return Ok(());
+    }
+    if meta.len() > CAT_MAX {
+        writeln!(
+            out,
+            "cat {path}: {} bytes exceeds {} byte limit",
+            meta.len(),
+            CAT_MAX
+        )?;
+        return Ok(());
+    }
+    match std::fs::read_to_string(path) {
+        Ok(s) => write!(out, "{s}"),
+        Err(e) => writeln!(out, "cat {path}: {e}"),
+    }
+}
+
+fn cmd_echo<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
+    let rest: Vec<&str> = args.pos.iter().copied().skip(1).collect();
+    writeln!(out, "{}", rest.join(" "))
+}
+
+fn cmd_session<W: Write>(out: &mut W, authed: bool) -> std::io::Result<()> {
     let probes = registry();
     let enabled = probes.all().iter().filter(|p| p.enabled()).count();
     let (recorded, dropped, _) = recorder().stats();
@@ -1599,6 +1737,14 @@ fn cmd_session<W: Write>(out: &mut W) -> std::io::Result<()> {
         "PROFILER",
         crate::profiler::status_line()
     )?;
+    let auth = if !password_configured() {
+        "off"
+    } else if authed {
+        "ok"
+    } else {
+        "required"
+    };
+    writeln!(out, " {:<12} {auth}", "AUTH")?;
     Ok(())
 }
 
@@ -1854,7 +2000,7 @@ pub fn init_lazy() {
 
 #[cfg(test)]
 mod tests {
-    use super::{matches_filters, sysenv_entries, Args};
+    use super::{matches_filters, secrets_match, sysenv_entries, Args};
     use crate::event::Event;
 
     #[test]
@@ -1926,5 +2072,13 @@ mod tests {
         assert!(matches_filters(&e, "a=1", ""));
         assert!(!matches_filters(&e, "a=2", ""));
         assert!(!matches_filters(&e, "", "Ok(3)"));
+    }
+
+    #[test]
+    fn password_compare_is_length_aware() {
+        assert!(secrets_match("secret", "secret"));
+        assert!(!secrets_match("secret", "secre"));
+        assert!(!secrets_match("secret", "secret!"));
+        assert!(!secrets_match("", "x"));
     }
 }

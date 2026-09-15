@@ -47,7 +47,7 @@ const USAGE: &str = "\
 rthas — Arthas-style runtime probes for Rust
 
 USAGE:
-    rthas <command> [options] [--pid PID | --sock PATH | --sock-dir DIR]
+    rthas <command> [options] [--pid PID | --sock PATH | --sock-dir DIR | --password P]
 
 DISCOVERY:
     ps                              list processes with a live rthas agent
@@ -104,6 +104,9 @@ PROCESS:
     options [name] [value]          list or set runtime knobs
     version                         rthas library version in this process
     stop                            unbind the agent; attach restarts it
+    pwd / cat PATH / echo TEXT      process cwd and files
+    auth [password]                 authenticate if RTHAS_PASSWORD is set
+    <cmd> | grep|tee|wc             in-process pipes (also: rthas list \\| grep foo)
 
 If no target is given and exactly one rthas agent is running, it is used
 automatically. Set RTHAS_SOCK_DIR if your processes use a non-/tmp directory.
@@ -122,6 +125,8 @@ EXAMPLES:
     rthas tt handle_request --count 5
     rthas tt --list
     rthas memory
+    rthas list \\| grep handle
+    rthas --password secret session
 ";
 
 /// Accept `rthas --pid 5 list` as a synonym of `rthas list --pid 5`.
@@ -132,13 +137,14 @@ fn rotate_target_flags(argv: Vec<String>) -> Vec<String> {
     let flag = argv.first().map(String::as_str).unwrap_or("");
     let inline = flag.starts_with("--pid=")
         || flag.starts_with("--sock=")
-        || flag.starts_with("--sock-dir=");
+        || flag.starts_with("--sock-dir=")
+        || flag.starts_with("--password=");
     if inline {
         let mut out = argv[1..].to_vec();
         out.push(argv[0].clone());
         return out;
     }
-    if matches!(flag, "--pid" | "--sock" | "--sock-dir") && argv.len() >= 2 {
+    if matches!(flag, "--pid" | "--sock" | "--sock-dir" | "--password") && argv.len() >= 2 {
         let mut out = argv[2..].to_vec();
         out.push(argv[0].clone());
         out.push(argv[1].clone());
@@ -176,7 +182,7 @@ fn main() {
         "shell" => cmd_shell(&argv[1..]),
         cmd @ ("list" | "trace" | "watch" | "stack" | "dashboard" | "thread" | "profiler" | "stats" | "top"
         | "on" | "off" | "clear" | "ping" | "monitor" | "tt" | "sysenv" | "memory" | "version"
-        | "session" | "options" | "stop" | "reset") => {
+        | "session" | "options" | "stop" | "reset" | "auth" | "pwd" | "cat" | "echo") => {
             if let Err(e) = cmd_remote(cmd, &argv[1..]) {
                 eprintln!("rthas: {e}");
                 std::process::exit(1);
@@ -199,6 +205,7 @@ struct Target {
     sock: Option<PathBuf>,
     pid: Option<u32>,
     sock_dir: Option<PathBuf>,
+    password: Option<String>,
 }
 
 fn parse_target(args: &[String]) -> (Target, Vec<String>) {
@@ -206,6 +213,7 @@ fn parse_target(args: &[String]) -> (Target, Vec<String>) {
         sock: None,
         pid: None,
         sock_dir: None,
+        password: None,
     };
     let mut forwarded: Vec<String> = Vec::with_capacity(args.len());
     let mut it = args.iter();
@@ -214,9 +222,13 @@ fn parse_target(args: &[String]) -> (Target, Vec<String>) {
             "--sock" => target.sock = it.next().map(PathBuf::from),
             "--sock-dir" => target.sock_dir = it.next().map(PathBuf::from),
             "--pid" => target.pid = it.next().and_then(|v| v.parse().ok()),
+            "--password" => target.password = it.next().cloned(),
             _ if arg.starts_with("--sock=") => target.sock = arg.split_once('=').map(|(_, v)| v.into()),
             _ if arg.starts_with("--pid=") => {
                 target.pid = arg.split_once('=').and_then(|(_, v)| v.parse().ok())
+            }
+            _ if arg.starts_with("--password=") => {
+                target.password = arg.split_once('=').map(|(_, v)| v.to_string())
             }
             _ => forwarded.push(arg.clone()),
         }
@@ -410,6 +422,7 @@ fn cmd_ps(all: bool, filter: &str) {
         sock: None,
         pid: None,
         sock_dir: std::env::var("RTHAS_SOCK_DIR").ok().map(PathBuf::from),
+        password: None,
     });
 
     if !all {
@@ -678,6 +691,56 @@ fn default_sock_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
 }
 
+fn password_for(target: &Target) -> Option<String> {
+    target
+        .password
+        .clone()
+        .or_else(|| {
+            std::env::var("RTHAS_PASSWORD")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+}
+
+fn maybe_auth(stream: &mut UnixStream, target: &Target) -> Result<(), String> {
+    let Some(password) = password_for(target) else {
+        return Ok(());
+    };
+    let line = format!("auth --password={password}\n");
+    stream
+        .write_all(line.as_bytes())
+        .and_then(|_| stream.flush())
+        .map_err(|e| format!("auth send: {e}"))?;
+    let reply = read_reply(stream)?;
+    if reply.contains("Authentication result: true") {
+        Ok(())
+    } else {
+        Err(format!(
+            "auth failed (set --password / RTHAS_PASSWORD to match the process):\n{reply}"
+        ))
+    }
+}
+
+fn read_reply(stream: &mut UnixStream) -> Result<String, String> {
+    let mut reader = BufReader::new(stream.try_clone().map_err(|e| format!("clone: {e}"))?);
+    let mut line = String::new();
+    let mut out = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                if line.trim() == END {
+                    break;
+                }
+                out.push_str(&line);
+            }
+            Err(e) => return Err(format!("read: {e}")),
+        }
+    }
+    Ok(out)
+}
+
 fn cmd_remote(cmd: &str, args: &[String]) -> Result<(), String> {
     let (target, forwarded) = parse_target(args);
     let sock = resolve_sock(&target)?;
@@ -690,6 +753,8 @@ fn cmd_remote(cmd: &str, args: &[String]) -> Result<(), String> {
 
     let mut stream = UnixStream::connect(&sock)
         .map_err(|e| format!("connect {}: {e}", sock.display()))?;
+
+    maybe_auth(&mut stream, &target)?;
 
     let mut line = String::from(cmd);
     for a in &forwarded {
@@ -746,6 +811,10 @@ fn cmd_shell(args: &[String]) {
             std::process::exit(1);
         }
     };
+    if let Err(e) = maybe_auth(&mut stream, &target) {
+        eprintln!("rthas: {e}");
+        std::process::exit(1);
+    }
     eprintln!("connected to {} (type 'help', 'quit' to leave)", sock.display());
 
     let stdin = std::io::stdin();
@@ -845,5 +914,25 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert_eq!(rotate_target_flags(argv.clone()), argv);
+
+        let argv: Vec<String> = ["--password", "s3cret", "session"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            rotate_target_flags(argv),
+            vec!["session", "--password", "s3cret"]
+        );
+    }
+
+    #[test]
+    fn parse_target_keeps_password() {
+        let args: Vec<String> = ["--password=s3cret", "pwd"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (t, rest) = parse_target(&args);
+        assert_eq!(t.password.as_deref(), Some("s3cret"));
+        assert_eq!(rest, vec!["pwd"]);
     }
 }
