@@ -271,10 +271,7 @@ fn dispatch_verb<W: Write>(line: &str, out: &mut W, authed: &mut bool) -> std::i
         "cat" => cmd_cat(&args, out)?,
         "echo" => cmd_echo(&args, out)?,
         "grep" | "tee" | "wc" => {
-            writeln!(
-                out,
-                "{verb} is a pipe. try: <command> | {verb} ..."
-            )?;
+            writeln!(out, "{verb} is a pipe. try: <command> | {verb} ...")?;
         }
         "list" => cmd_list(&args, out)?,
         "on" => {
@@ -301,6 +298,8 @@ fn dispatch_verb<W: Write>(line: &str, out: &mut W, authed: &mut bool) -> std::i
         "monitor" => cmd_monitor(&args, out)?,
         "tt" => cmd_tt(&args, out)?,
         "sysenv" => cmd_sysenv(&args, out)?,
+        "jvm" | "runtime" => cmd_jvm(out)?,
+        "sysprop" => cmd_sysprop(&args, out)?,
         "memory" => cmd_memory(out)?,
         "version" => writeln!(out, "rthas {}", env!("CARGO_PKG_VERSION"))?,
         "session" => cmd_session(out, *authed)?,
@@ -384,6 +383,8 @@ rthas control commands
   tt --index N                          inspect one fragment
   tt --delete N / tt --clear            drop one fragment / drop all
   sysenv [NAME]                         process environment (read-only)
+  jvm / runtime                         process snapshot (os / rustc / features)
+  sysprop [NAME]                        read-only knobs (`os`, `rustc`, `rthas`)
   memory                                OS memory: rss / virt / threads / fds
   version                               rthas library version in this process
   session                               pid, socket, probes, ring, tunnel
@@ -1561,6 +1562,21 @@ fn sysenv_entries(name: &str) -> Vec<(String, String)> {
     v
 }
 
+fn cmd_jvm<W: Write>(out: &mut W) -> std::io::Result<()> {
+    write!(out, "{}", crate::runtime::render_jvm())
+}
+
+fn cmd_sysprop<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
+    if args.pos.get(2).is_some() {
+        writeln!(
+            out,
+            "sysprop is read-only (Rust has no JVM System.setProperty). use `options` for rthas knobs"
+        )?;
+        return Ok(());
+    }
+    write!(out, "{}", crate::runtime::render_sysprop(args.pattern()))
+}
+
 fn cmd_sysenv<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
     let name = args.pattern();
     let rows = sysenv_entries(name);
@@ -2000,7 +2016,7 @@ pub fn init_lazy() {
 
 #[cfg(test)]
 mod tests {
-    use super::{matches_filters, secrets_match, sysenv_entries, Args};
+    use super::{cmd_jvm, cmd_sysprop, matches_filters, secrets_match, sysenv_entries, Args};
     use crate::event::Event;
 
     #[test]
@@ -2049,6 +2065,24 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "PATH");
         assert!(sysenv_entries("RTHAS_NO_SUCH_VAR_XYZ").is_empty());
+    }
+
+    #[test]
+    fn sysprop_refuses_writes() {
+        let args = Args::parse("sysprop os.name linux");
+        let mut buf = Vec::new();
+        cmd_sysprop(&args, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("read-only"));
+    }
+
+    #[test]
+    fn jvm_command_prints_runtime_section() {
+        let mut buf = Vec::new();
+        cmd_jvm(&mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("RUNTIME"));
+        assert!(s.contains("RUSTC"));
     }
 
     #[test]

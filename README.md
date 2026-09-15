@@ -23,6 +23,7 @@ Java gets [Arthas](https://github.com/alibaba/arthas) because the JVM can rewrit
 | `monitor` periodic stats | bytecode instrumentation | ring buffer aggregated per interval | ✅ | ✅ implemented (also in `dashboard`) |
 | `tt` time tunnel | bytecode + object refs | indexed `Debug` snapshots | ✅ | ✅ record / list / inspect (no replay) |
 | `sysenv` / `memory` / `session` / `options` / `version` / `stop` | JMX / agent | process env, OS memory, runtime knobs | ✅ | ✅ implemented |
+| `jvm` / `sysprop` | JMX | rustc/os/features snapshot; read-only knobs | ✅ | ✅ implemented (`runtime` aliases `jvm`) |
 | `auth` + pipes (`grep` / `tee` / `wc`) / `pwd` / `cat` | telnet session | `RTHAS_PASSWORD` per connection; in-process pipes | ✅ | ✅ implemented |
 | Restart-free attach to an **instrumented** process | Attach API | trigger file wakes a deferred agent | ✅ | ✅ implemented |
 | `profiler` flame graph | async-profiler | SIGPROF sampling (`pprof`) | ✅ | ✅ start / stop / status (cpu; text + collapsed + svg) |
@@ -122,6 +123,10 @@ cargo run --bin rthas -- tt handle_request --count 5
 cargo run --bin rthas -- tt --list
 cargo run --bin rthas -- tt --index 1000
 
+# Runtime snapshot (Arthas jvm / sysprop analog; knobs are read-only)
+cargo run --bin rthas -- jvm
+cargo run --bin rthas -- sysprop rustc
+
 # Interactive session
 cargo run --bin rthas -- shell
 #   rthas> list | grep handle
@@ -150,6 +155,8 @@ cargo run --bin rthas -- shell
 | `thread [--n N] [--by tid\|cpu\|name] [<tid>] [--all]` | Per-thread CPU + last span; `--n` / `<tid>` / `--all` dump native stacks |
 | `profiler start\|stop\|status` | CPU sampling (SIGPROF). `--seconds F` one-shot; `--format text\|collapsed\|flamegraph` |
 | `memory` | OS memory: rss / virt / threads / fds |
+| `jvm` (`runtime`) | Process snapshot: os / arch / rustc / features / memory |
+| `sysprop [NAME]` | Read-only knobs (`os`, `rustc`, `rthas`); no `System.setProperty` |
 | `sysenv [NAME]` | Process environment (read-only) |
 | `session` | pid, socket, probes, ring, tunnel, profiler, auth |
 | `options [name] [value]` | List or set runtime knobs (`max-str`, `tz-hours`) |
@@ -324,6 +331,7 @@ A disabled probe has **zero allocation** and is always branch-predicted taken. A
 │  │  probe.rs     — static sites + registry │ │
 │  │  span.rs      — thread-local stack      │ │
 │  │  sample.rs    — OS metrics: /proc, Mach │ │
+│  │  runtime.rs   — jvm / sysprop snapshot  │ │
 │  │  thread_dump.rs — SIGURG native stacks  │ │
 │  │  profiler.rs  — SIGPROF CPU sampling    │ │
 │  │  time.rs      — monotonic + wall-clock  │ │

@@ -99,6 +99,8 @@ PROCESS:
                                     --format text|collapsed|flamegraph,
                                     --file PATH, --full)
     memory                          OS memory: rss / virt / threads / fds
+    jvm                             runtime snapshot (os / rustc / features)
+    sysprop [NAME]                  read-only knobs (`os`, `rustc`, `rthas`)
     sysenv [NAME]                   process environment (read-only)
     session                         pid, socket, probes, ring, tunnel
     options [name] [value]          list or set runtime knobs
@@ -125,6 +127,8 @@ EXAMPLES:
     rthas tt handle_request --count 5
     rthas tt --list
     rthas memory
+    rthas jvm
+    rthas sysprop rustc
     rthas list \\| grep handle
     rthas --password secret session
 ";
@@ -181,7 +185,8 @@ fn main() {
         },
         "shell" => cmd_shell(&argv[1..]),
         cmd @ ("list" | "trace" | "watch" | "stack" | "dashboard" | "thread" | "profiler" | "stats" | "top"
-        | "on" | "off" | "clear" | "ping" | "monitor" | "tt" | "sysenv" | "memory" | "version"
+        | "on" | "off" | "clear" | "ping" | "monitor" | "tt" | "sysenv" | "jvm" | "runtime"
+        | "sysprop" | "memory" | "version"
         | "session" | "options" | "stop" | "reset" | "auth" | "pwd" | "cat" | "echo") => {
             if let Err(e) = cmd_remote(cmd, &argv[1..]) {
                 eprintln!("rthas: {e}");
