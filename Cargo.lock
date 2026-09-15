@@ -647,6 +647,7 @@ name = "rthas"
 version = "0.1.0"
 dependencies = [
  "backtrace",
+ "inferno",
  "inventory",
  "libc",
  "pprof",

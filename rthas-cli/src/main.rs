@@ -95,8 +95,8 @@ PROCESS:
     thread [opts]                   per-thread CPU and last recorded span
                                     (--n N dumps top N native stacks,
                                     --all / <tid> / --stack)
-    profiler [start|stop|status]    CPU sampling (SIGPROF)
-                                    (--seconds F, --hz N,
+    profiler [start|stop|status]    sampling (--event cpu|wall; cpu=SIGPROF,
+                                    wall=ITIMER_REAL). --seconds F, --hz N,
                                     --format text|collapsed|flamegraph,
                                     --file PATH, --full)
     memory                          OS memory: rss / virt / threads / fds
@@ -123,6 +123,7 @@ EXAMPLES:
     rthas dashboard --interval 0.5
     rthas thread --by cpu --n 3
     rthas profiler --seconds 5
+    rthas profiler --seconds 5 --event wall
     rthas top --n 5 --by max
     rthas monitor handle_request --interval 1 --count 3
     rthas tt handle_request --count 5

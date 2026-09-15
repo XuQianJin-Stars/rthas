@@ -199,6 +199,7 @@ async fn main() {
     eprintln!("  cargo run --bin rthas -- watch read_block --ret Err --count 5");
     eprintln!("  cargo run --bin rthas -- top --n 5 --by max");
     eprintln!("  cargo run --bin rthas -- profiler --seconds 5");
+    eprintln!("  cargo run --bin rthas -- profiler --seconds 5 --event wall");
 
     let mut id: u64 = 0;
     loop {

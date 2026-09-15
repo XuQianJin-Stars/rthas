@@ -365,6 +365,7 @@ rthas control commands
      getSamples       sample count of the current session
      --seconds F      one-shot: start, wait F seconds, stop
      --hz N           sample rate (1–1000, default 99)
+     --event cpu|wall   cpu = SIGPROF (on-CPU); wall = ITIMER_REAL
      --format text|collapsed|flamegraph   stop output (default text)
      --file PATH      also write the report to PATH
      --n N / --depth N   hottest frames / tree depth
@@ -1108,15 +1109,17 @@ fn cmd_profiler<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
     let top_n = args.num("n", 15usize);
     let depth = args.num("depth", 24usize);
     let full = args.flag("full");
-
-    if let Some(event) = args.get("event") {
-        if !event.is_empty() && event != "cpu" {
-            writeln!(out, "only --event cpu is supported; ignoring '{event}'")?;
+    let event = match crate::profiler::EventKind::parse(args.get("event").unwrap_or("")) {
+        Ok(e) => e,
+        Err(e) => {
+            writeln!(out, "{e}")?;
+            return Ok(());
         }
-    }
+    };
+    let compact = !full && event == crate::profiler::EventKind::Cpu;
 
     if seconds > 0.0 && matches!(action, "" | "start") {
-        return profiler_oneshot(seconds, hz, format, file, top_n, depth, full, out);
+        return profiler_oneshot(seconds, hz, event, format, file, top_n, depth, compact, out);
     }
 
     match action {
@@ -1130,15 +1133,16 @@ fn cmd_profiler<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
             }
             Ok(())
         }
-        "start" => match crate::profiler::start(hz) {
+        "start" => match crate::profiler::start_kind(hz, event) {
             Ok(()) => writeln!(
                 out,
-                "Started [cpu] profiling at {} Hz",
+                "Started [{}] profiling at {} Hz",
+                event.as_str(),
                 crate::profiler::clamp_hz(hz)
             ),
             Err(e) => writeln!(out, "{e}"),
         },
-        "stop" => profiler_dump(format, file, top_n, depth, full, out),
+        "stop" => profiler_dump(format, file, top_n, depth, compact, out),
         "status" => writeln!(out, "{}", crate::profiler::status_line()),
         "getSamples" | "getsamples" | "get-samples" | "samples" => {
             match crate::profiler::sample_count() {
@@ -1156,29 +1160,31 @@ fn cmd_profiler<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
 fn profiler_oneshot<W: Write>(
     seconds: f64,
     hz: i32,
+    event: crate::profiler::EventKind,
     format: &str,
     file: &str,
     top_n: usize,
     depth: usize,
-    full: bool,
+    compact: bool,
     out: &mut W,
 ) -> std::io::Result<()> {
     if crate::profiler::is_running() {
         writeln!(out, "profiler is already running; `profiler stop` first")?;
         return Ok(());
     }
-    if let Err(e) = crate::profiler::start(hz) {
+    if let Err(e) = crate::profiler::start_kind(hz, event) {
         writeln!(out, "{e}")?;
         return Ok(());
     }
     writeln!(
         out,
-        "Started [cpu] profiling at {} Hz for {seconds:.1}s",
+        "Started [{}] profiling at {} Hz for {seconds:.1}s",
+        event.as_str(),
         crate::profiler::clamp_hz(hz)
     )?;
     let _ = out.flush();
     std::thread::sleep(Duration::from_secs_f64(seconds.max(0.05)));
-    profiler_dump(format, file, top_n, depth, full, out)
+    profiler_dump(format, file, top_n, depth, compact, out)
 }
 
 fn profiler_dump<W: Write>(
@@ -1186,7 +1192,7 @@ fn profiler_dump<W: Write>(
     file: &str,
     top_n: usize,
     depth: usize,
-    full: bool,
+    compact: bool,
     out: &mut W,
 ) -> std::io::Result<()> {
     let snap = match crate::profiler::stop() {
@@ -1198,7 +1204,8 @@ fn profiler_dump<W: Write>(
     };
     writeln!(
         out,
-        "Stopped [cpu] profiling. samples={} elapsed={:.1}s hz={}",
+        "Stopped [{}] profiling. samples={} elapsed={:.1}s hz={}",
+        snap.event.as_str(),
         snap.total(),
         snap.elapsed.as_secs_f64(),
         snap.hz
@@ -1230,8 +1237,7 @@ fn profiler_dump<W: Write>(
             },
             Err(e) => writeln!(out, "could not create {}: {e}", path.display())?,
         }
-        // A few hot frames so the terminal is not only a path.
-        let text = snap.render_text(4, 8, !full);
+        let text = snap.render_text(4, 8, compact);
         write_profiler_body(out, &text)?;
         return Ok(());
     }
@@ -1239,7 +1245,7 @@ fn profiler_dump<W: Write>(
     let body = if kind == "collapsed" {
         snap.render_collapsed()
     } else {
-        snap.render_text(depth, top_n, !full)
+        snap.render_text(depth, top_n, compact)
     };
     write_profiler_body(out, &body)?;
 

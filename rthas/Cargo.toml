@@ -26,6 +26,8 @@ libc = "0.2"
 # CPU sampling for `profiler`. Off until `profiler start`; the probe hot path
 # never touches it. `flamegraph` writes SVG the way Arthas dumps HTML.
 pprof = { version = "0.14", default-features = false, features = ["flamegraph"] }
+# SVG for `profiler --event wall` (cpu flamegraphs still go through pprof).
+inferno = { version = "0.11", default-features = false }
 # Native stacks for `thread <tid>` / `--n` / `--all`. Captured as instruction
 # pointers in a signal handler, symbolised afterwards.
 backtrace = "0.3"

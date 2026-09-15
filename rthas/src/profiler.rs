@@ -12,15 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! In-process CPU profiler (Arthas `profiler`).
+//! In-process profiler (Arthas `profiler`).
 //!
-//! Sampling uses SIGPROF via `pprof`. The handler is installed only while a
+//! `--event cpu` (default) samples with SIGPROF via `pprof` — only while the
+//! thread is on CPU. `--event wall` uses ITIMER_REAL / SIGALRM so sleeping
+//! `.await`s still produce stacks. The handler is installed only while a
 //! session is running; a disabled probe is still one atomic load, and this
 //! module is not on that path.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Write;
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -37,8 +41,36 @@ const BLOCKLIST: &[&str] = &[
     "ld-linux",
 ];
 
+/// Sampling event. `cpu` is SIGPROF (on-CPU only); `wall` is ITIMER_REAL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventKind {
+    Cpu,
+    Wall,
+}
+
+impl EventKind {
+    pub fn parse(name: &str) -> Result<Self, String> {
+        match name {
+            "" | "cpu" => Ok(Self::Cpu),
+            "wall" | "wall-clock" | "wallclock" => Ok(Self::Wall),
+            other => Err(format!(
+                "unknown --event '{other}'. try cpu or wall (alloc/lock need a JVM)"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Wall => "wall",
+        }
+    }
+}
+
 struct Running {
-    guard: ProfilerGuard<'static>,
+    kind: EventKind,
+    guard: Option<ProfilerGuard<'static>>,
+    wall_prev: Option<libc::sigaction>,
     started: Instant,
     hz: i32,
 }
@@ -62,29 +94,47 @@ pub fn is_running() -> bool {
     session().is_some()
 }
 
-pub fn start(hz: i32) -> Result<(), String> {
+pub fn start_kind(hz: i32, kind: EventKind) -> Result<(), String> {
     let hz = clamp_hz(hz);
     let mut slot = session();
     if slot.is_some() {
         return Err("profiler is already running; `profiler stop` first".into());
     }
-    let guard = pprof::ProfilerGuardBuilder::default()
-        .frequency(hz)
-        .blocklist(BLOCKLIST)
-        .build()
-        .map_err(|e| format!("failed to start profiler: {e}"))?;
-    *slot = Some(Running {
-        guard,
-        started: Instant::now(),
-        hz,
-    });
+    let running = match kind {
+        EventKind::Cpu => {
+            let guard = pprof::ProfilerGuardBuilder::default()
+                .frequency(hz)
+                .blocklist(BLOCKLIST)
+                .build()
+                .map_err(|e| format!("failed to start profiler: {e}"))?;
+            Running {
+                kind,
+                guard: Some(guard),
+                wall_prev: None,
+                started: Instant::now(),
+                hz,
+            }
+        }
+        EventKind::Wall => {
+            let prev = wall_start(hz)?;
+            Running {
+                kind,
+                guard: None,
+                wall_prev: Some(prev),
+                started: Instant::now(),
+                hz,
+            }
+        }
+    };
+    *slot = Some(running);
     Ok(())
 }
 
 pub fn status_line() -> String {
     match session().as_ref() {
         Some(s) => format!(
-            "[cpu] profiling is running for {:.1} seconds at {} Hz",
+            "[{}] profiling is running for {:.1} seconds at {} Hz",
+            s.kind.as_str(),
             s.started.elapsed().as_secs_f64(),
             s.hz
         ),
@@ -98,12 +148,19 @@ pub fn sample_count() -> Result<i64, String> {
     let running = slot
         .as_ref()
         .ok_or_else(|| "profiler is not running".to_string())?;
-    let report = running
-        .guard
-        .report()
-        .build()
-        .map_err(|e| format!("profiler report: {e}"))?;
-    Ok(report.data.values().map(|c| *c as i64).sum())
+    match running.kind {
+        EventKind::Cpu => {
+            let report = running
+                .guard
+                .as_ref()
+                .ok_or("profiler is not running")?
+                .report()
+                .build()
+                .map_err(|e| format!("profiler report: {e}"))?;
+            Ok(report.data.values().map(|c| *c as i64).sum())
+        }
+        EventKind::Wall => Ok(wall_sample_count()),
+    }
 }
 
 pub fn stop() -> Result<Snapshot, String> {
@@ -112,23 +169,34 @@ pub fn stop() -> Result<Snapshot, String> {
         .ok_or_else(|| "profiler is not running".to_string())?;
     let elapsed = running.started.elapsed();
     let hz = running.hz;
-    let report = running
-        .guard
-        .report()
-        .build()
-        .map_err(|e| format!("profiler report: {e}"))?;
-    Ok(Snapshot::from_report(report, elapsed, hz))
+    match running.kind {
+        EventKind::Cpu => {
+            let guard = running.guard.ok_or("profiler is not running")?;
+            let report = guard
+                .report()
+                .build()
+                .map_err(|e| format!("profiler report: {e}"))?;
+            Ok(Snapshot::from_report(report, elapsed, hz))
+        }
+        EventKind::Wall => {
+            if let Some(prev) = running.wall_prev {
+                wall_stop(prev);
+            }
+            Ok(wall_snapshot(elapsed, hz))
+        }
+    }
 }
 
-/// Folded stacks plus the original `pprof` report (needed for SVG).
+/// Folded stacks plus, for CPU sessions, the original `pprof` report (SVG).
 pub struct Snapshot {
+    pub event: EventKind,
     pub elapsed: Duration,
     pub hz: i32,
     /// Samples that survived frame filtering.
     pub stacks: Vec<(Vec<String>, i64)>,
-    /// Samples `pprof` recorded, including stacks we later dropped.
+    /// Samples recorded, including stacks we later dropped.
     pub raw_samples: i64,
-    report: pprof::Report,
+    report: Option<pprof::Report>,
 }
 
 impl Snapshot {
@@ -144,11 +212,25 @@ impl Snapshot {
         }
         stacks.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         Self {
+            event: EventKind::Cpu,
             elapsed,
             hz,
             stacks,
             raw_samples,
-            report,
+            report: Some(report),
+        }
+    }
+
+    fn from_wall(stacks: Vec<(Vec<String>, i64)>, raw_samples: i64, elapsed: Duration, hz: i32) -> Self {
+        let mut stacks = stacks;
+        stacks.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Self {
+            event: EventKind::Wall,
+            elapsed,
+            hz,
+            stacks,
+            raw_samples,
+            report: None,
         }
     }
 
@@ -162,18 +244,47 @@ impl Snapshot {
         } else {
             self.stacks.clone()
         };
-        render_text(&stacks, self.total(), self.elapsed, self.hz, depth, top_n)
+        render_text(
+            &stacks,
+            self.total(),
+            self.elapsed,
+            self.hz,
+            depth,
+            top_n,
+            self.event.as_str(),
+        )
     }
 
     pub fn render_collapsed(&self) -> String {
         render_collapsed(&self.stacks)
     }
 
-    pub fn write_flamegraph<W: Write>(&self, mut writer: W) -> Result<(), String> {
-        self.report
-            .flamegraph(&mut writer)
-            .map_err(|e| format!("flamegraph: {e}"))
+    pub fn write_flamegraph<W: Write>(&self, writer: W) -> Result<(), String> {
+        if let Some(report) = &self.report {
+            return report
+                .flamegraph(writer)
+                .map_err(|e| format!("flamegraph: {e}"));
+        }
+        flamegraph_from_stacks(&self.stacks, writer)
     }
+}
+
+fn flamegraph_from_stacks<W: Write>(
+    stacks: &[(Vec<String>, i64)],
+    writer: W,
+) -> Result<(), String> {
+    let lines: Vec<String> = stacks
+        .iter()
+        .filter(|(s, _)| !s.is_empty())
+        .map(|(s, n)| format!("{} {n}", s.join(";")))
+        .collect();
+    if lines.is_empty() {
+        return Err("no samples to render as a flamegraph".into());
+    }
+    let mut opts = inferno::flamegraph::Options::default();
+    opts.title = "rthas profiler [wall]".into();
+    inferno::flamegraph::from_lines(&mut opts, lines.iter().map(String::as_str), writer)
+        .map_err(|e| format!("flamegraph: {e}"))
 }
 
 fn frames_to_stack(frames: &pprof::Frames) -> Vec<String> {
@@ -212,6 +323,7 @@ fn skip_frame(name: &str) -> bool {
     name.contains("pprof::")
         || name.contains("backtrace::")
         || name.contains("rthas::profiler")
+        || name.contains("on_sigalrm")
         || name.contains("sigtramp")
         || name.contains("_sigtramp")
 }
@@ -292,11 +404,12 @@ pub fn render_text(
     hz: i32,
     depth: usize,
     top_n: usize,
+    event: &str,
 ) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "── rthas profiler ── {:.1}s ── {hz} Hz ── {total} samples ──",
+        "── rthas profiler [{event}] ── {:.1}s ── {hz} Hz ── {total} samples ──",
         elapsed.as_secs_f64()
     );
     if total <= 0 {
@@ -369,8 +482,156 @@ pub fn render_collapsed(stacks: &[(Vec<String>, i64)]) -> String {
     out
 }
 
-/// Exercise the sampler. Isolated from other tests because SIGPROF is
-/// process-global and cargo test runs cases in parallel.
+// ---------------------------------------------------------------------------
+// Wall clock: ITIMER_REAL / SIGALRM (samples even when the process is asleep)
+// ---------------------------------------------------------------------------
+
+const WALL_CAP: usize = 4096;
+const WALL_DEPTH: usize = 64;
+
+#[derive(Copy, Clone)]
+struct WallSlot {
+    len: usize,
+    ips: [*mut libc::c_void; WALL_DEPTH],
+}
+
+static WALL_ON: AtomicBool = AtomicBool::new(false);
+static WALL_NEXT: AtomicUsize = AtomicUsize::new(0);
+static mut WALL_SLOTS: [WallSlot; WALL_CAP] = [WallSlot {
+    len: 0,
+    ips: [ptr::null_mut(); WALL_DEPTH],
+}; WALL_CAP];
+
+extern "C" fn on_sigalrm(_sig: libc::c_int) {
+    if !WALL_ON.load(Ordering::Relaxed) {
+        return;
+    }
+    let seq = WALL_NEXT.fetch_add(1, Ordering::Relaxed);
+    let i = seq % WALL_CAP;
+    let mut ips = [ptr::null_mut(); WALL_DEPTH];
+    let mut len = 0usize;
+    // SAFETY: signal handler; only stores instruction pointers.
+    unsafe {
+        backtrace::trace_unsynchronized(|frame| {
+            if len >= WALL_DEPTH {
+                return false;
+            }
+            ips[len] = frame.ip();
+            len += 1;
+            true
+        });
+        WALL_SLOTS[i].len = len;
+        WALL_SLOTS[i].ips = ips;
+    }
+}
+
+fn wall_start(hz: i32) -> Result<libc::sigaction, String> {
+    WALL_NEXT.store(0, Ordering::SeqCst);
+    WALL_ON.store(true, Ordering::SeqCst);
+    let prev = unsafe { install_sigalrm() };
+    if set_itimer_real(hz) != 0 {
+        WALL_ON.store(false, Ordering::SeqCst);
+        unsafe { restore_sigalrm(prev) };
+        return Err("setitimer(ITIMER_REAL) failed".into());
+    }
+    Ok(prev)
+}
+
+fn wall_stop(prev: libc::sigaction) {
+    let _ = set_itimer_real(0);
+    WALL_ON.store(false, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(5));
+    unsafe { restore_sigalrm(prev) };
+}
+
+fn wall_sample_count() -> i64 {
+    WALL_NEXT.load(Ordering::Relaxed) as i64
+}
+
+fn wall_snapshot(elapsed: Duration, hz: i32) -> Snapshot {
+    let ticks = WALL_NEXT.load(Ordering::SeqCst);
+    let n = ticks.min(WALL_CAP);
+    let mut folded: HashMap<Vec<String>, i64> = HashMap::new();
+    let mut raw_samples = 0i64;
+    // SAFETY: timer is off; handlers have had a few ms to finish.
+    unsafe {
+        for i in 0..n {
+            let slot = ptr::addr_of!(WALL_SLOTS[i]).read();
+            if slot.len == 0 {
+                continue;
+            }
+            raw_samples += 1;
+            let stack = symbolise_wall(&slot.ips[..slot.len]);
+            if stack.is_empty() {
+                continue;
+            }
+            *folded.entry(stack).or_insert(0) += 1;
+        }
+    }
+    Snapshot::from_wall(folded.into_iter().collect(), raw_samples, elapsed, hz)
+}
+
+fn symbolise_wall(ips: &[*mut libc::c_void]) -> Vec<String> {
+    let mut names = Vec::new();
+    for &ip in ips {
+        let mut hit = false;
+        backtrace::resolve(ip, |sym| {
+            if hit {
+                return;
+            }
+            let raw = match (sym.name(), sym.filename()) {
+                (Some(name), _) => name.to_string(),
+                _ => return,
+            };
+            let name = trim_rustc_hash(&raw);
+            if skip_frame(name) {
+                hit = true;
+                return;
+            }
+            names.push(name.to_string());
+            hit = true;
+        });
+    }
+    names.reverse();
+    names
+}
+
+fn set_itimer_real(hz: i32) -> libc::c_int {
+    let (sec, usec) = if hz <= 0 {
+        (0, 0)
+    } else {
+        let us = 1_000_000 / i64::from(hz.max(1));
+        ((us / 1_000_000) as libc::time_t, (us % 1_000_000) as libc::suseconds_t)
+    };
+    let mut it = libc::itimerval {
+        it_interval: libc::timeval {
+            tv_sec: sec,
+            tv_usec: usec,
+        },
+        it_value: libc::timeval {
+            tv_sec: sec,
+            tv_usec: usec,
+        },
+    };
+    unsafe { libc::setitimer(libc::ITIMER_REAL, &mut it, ptr::null_mut()) }
+}
+
+unsafe fn install_sigalrm() -> libc::sigaction {
+    let mut new: libc::sigaction = std::mem::zeroed();
+    new.sa_sigaction = on_sigalrm as libc::sighandler_t;
+    new.sa_flags = libc::SA_RESTART;
+    libc::sigemptyset(&mut new.sa_mask);
+    let mut old: libc::sigaction = std::mem::zeroed();
+    libc::sigaction(libc::SIGALRM, &new, &mut old);
+    old
+}
+
+unsafe fn restore_sigalrm(old: libc::sigaction) {
+    libc::sigaction(libc::SIGALRM, &old, ptr::null_mut());
+}
+
+/// Exercise the sampler. Isolated from other tests because SIGPROF / SIGALRM
+/// are process-global and cargo test runs cases in parallel.
 #[cfg(test)]
 fn burn_cpu(ms: u64) -> u64 {
     let until = Instant::now() + Duration::from_millis(ms);
@@ -387,8 +648,11 @@ fn burn_cpu(ms: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_collapsed, render_text, trim_rustc_hash};
+    use super::{render_collapsed, render_text, trim_rustc_hash, EventKind};
+    use std::sync::Mutex;
     use std::time::Duration;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn sample_stacks() -> Vec<(Vec<String>, i64)> {
         vec![
@@ -417,9 +681,17 @@ mod tests {
     }
 
     #[test]
+    fn event_kind_parses_cpu_and_wall() {
+        assert_eq!(EventKind::parse("").unwrap(), EventKind::Cpu);
+        assert_eq!(EventKind::parse("cpu").unwrap(), EventKind::Cpu);
+        assert_eq!(EventKind::parse("wall").unwrap(), EventKind::Wall);
+        assert!(EventKind::parse("alloc").is_err());
+    }
+
+    #[test]
     fn text_tree_sums_to_one_hundred() {
         let stacks = sample_stacks();
-        let text = render_text(&stacks, 10, Duration::from_secs(1), 99, 8, 5);
+        let text = render_text(&stacks, 10, Duration::from_secs(1), 99, 8, 5, "cpu");
         assert!(text.contains("100.0%"));
         assert!(text.contains("handle_request"));
         assert!(text.contains("lookup"));
@@ -436,16 +708,18 @@ mod tests {
 
     #[test]
     fn empty_report_explains_itself() {
-        let text = render_text(&[], 0, Duration::from_millis(200), 99, 8, 5);
+        let text = render_text(&[], 0, Duration::from_millis(200), 99, 8, 5, "cpu");
         assert!(text.contains("no samples collected"));
     }
 
     #[test]
     fn start_stop_collects_samples() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _ = super::stop();
-        super::start(200).expect("start profiler");
+        super::start_kind(200, EventKind::Cpu).expect("start profiler");
         let _ = super::burn_cpu(400);
         let snap = super::stop().expect("stop profiler");
+        assert_eq!(snap.event, EventKind::Cpu);
         assert!(
             snap.total() > 0,
             "expected CPU samples after a busy loop, got 0 (elapsed {:?})",
@@ -453,6 +727,24 @@ mod tests {
         );
         let text = snap.render_text(8, 5, true);
         assert!(text.contains("samples"));
+        assert!(text.contains("[cpu]"));
+    }
+
+    #[test]
+    fn wall_samples_while_sleeping() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = super::stop();
+        super::start_kind(80, EventKind::Wall).expect("start wall profiler");
+        std::thread::sleep(Duration::from_millis(350));
+        let snap = super::stop().expect("stop wall profiler");
+        assert_eq!(snap.event, EventKind::Wall);
+        assert!(
+            snap.raw_samples > 0,
+            "expected wall samples during sleep, got raw=0 elapsed={:?}",
+            snap.elapsed
+        );
+        let text = snap.render_text(8, 5, false);
+        assert!(text.contains("[wall]"));
     }
 
     #[test]

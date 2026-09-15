@@ -26,7 +26,7 @@ Java gets [Arthas](https://github.com/alibaba/arthas) because the JVM can rewrit
 | `jvm` / `sysprop` | JMX | rustc/os/features snapshot; read-only knobs | ✅ | ✅ implemented (`runtime` aliases `jvm`) |
 | `auth` + pipes (`grep` / `tee` / `wc`) / `pwd` / `cat` | telnet session | `RTHAS_PASSWORD` per connection; in-process pipes | ✅ | ✅ implemented |
 | Restart-free attach to an **instrumented** process | Attach API | trigger file wakes a deferred agent | ✅ | ✅ implemented |
-| `profiler` flame graph | async-profiler | SIGPROF sampling (`pprof`) | ✅ | ✅ start / stop / status (cpu; text + collapsed + svg) |
+| `profiler` flame graph | async-profiler | SIGPROF (cpu) / ITIMER_REAL (wall) | ✅ | ✅ start / stop / status (`--event cpu\|wall`) |
 | Restart-free attach to an **un-instrumented** process | Attach API | eBPF uprobe only (Linux + root + symbols) | ⚠️ | ✅ `attach --ebpf` (name + latency; `trace`/`watch`/`stats`/`top`/`monitor`; no Debug args) |
 | `jad` decompile / `redefine` hot swap | runtime class redefinition | impossible (machine code is not rewritable) | ❌ | — |
 
@@ -114,6 +114,8 @@ cargo run --bin rthas -- thread --by cpu --n 3
 
 # CPU sample for a few seconds (text tree; --format flamegraph writes SVG)
 cargo run --bin rthas -- profiler --seconds 5
+# Wall clock: samples even while the process is asleep in .await
+cargo run --bin rthas -- profiler --seconds 5 --event wall
 
 # Periodic method stats (enables probes for the duration)
 cargo run --bin rthas -- monitor handle_request --interval 1 --count 3
@@ -153,7 +155,7 @@ cargo run --bin rthas -- shell
 | `tt --list [pattern]` / `tt --index N` / `tt --delete N` / `tt --clear` | List / inspect / drop fragments (no `tt -p` replay) |
 | `dashboard [--interval F] [--count N] [--n N]` | Live process overview, refreshes until Ctrl-C |
 | `thread [--n N] [--by tid\|cpu\|name] [<tid>] [--all]` | Per-thread CPU + last span; `--n` / `<tid>` / `--all` dump native stacks |
-| `profiler start\|stop\|status` | CPU sampling (SIGPROF). `--seconds F` one-shot; `--format text\|collapsed\|flamegraph` |
+| `profiler start\|stop\|status` | Sampling. `--event cpu` (default, SIGPROF) or `wall` (ITIMER_REAL). `--seconds F`; `--format text\|collapsed\|flamegraph` |
 | `memory` | OS memory: rss / virt / threads / fds |
 | `jvm` (`runtime`) | Process snapshot: os / arch / rustc / features / memory |
 | `sysprop [NAME]` | Read-only knobs (`os`, `rustc`, `rthas`); no `System.setProperty` |
@@ -194,14 +196,14 @@ Patterns use shell-style globbing: `*` is wildcard, no-`*` matches by substring.
 $ rthas profiler --seconds 3
 Started [cpu] profiling at 99 Hz for 3.0s
 Stopped [cpu] profiling. samples=280 elapsed=3.0s hz=99
-── rthas profiler ── 3.0s ── 99 Hz ── 280 samples ──
+── rthas profiler [cpu] ── 3.0s ── 99 Hz ── 280 samples ──
   SHARE  SAMPLES  STACK
   100.0%     280  example_app::handle_request
    48.2%     135    example_app::crunch
    21.4%      60    example_app::lookup_metadata
 ```
 
-Sampling uses SIGPROF (`pprof`); nothing is installed until `profiler start` or `--seconds`. The text tree omits tokio / std / pthread frames so your functions surface (`--full` keeps them). `--format collapsed` is input for speedscope / `flamegraph.pl`; `--format flamegraph` writes an SVG (`--file` or `/tmp/rthas-<pid>.svg`). This is a **native** stack sample — async work shows up as `poll`, not as the logical request. Use `trace` for that. Not available on `attach --ebpf`. ITIMER_PROF only ticks while the process is on CPU; a service that is mostly `.await`ing looks idle.
+Sampling uses SIGPROF (`pprof`) for `--event cpu` (the default) and ITIMER_REAL / SIGALRM for `--event wall`. Nothing is installed until `profiler start` or `--seconds`. The CPU text tree omits tokio / std / pthread frames so your functions surface (`--full` keeps them); wall keeps those frames so you can see park / poll. Wall samples the thread that receives SIGALRM each tick (often the runtime park thread), not every worker. `--format collapsed` is input for speedscope / `flamegraph.pl`; `--format flamegraph` writes an SVG (`--file` or `/tmp/rthas-<pid>.svg`). This is a **native** stack sample — async work shows up as `poll`, not as the logical request. Use `trace` for that. Not available on `attach --ebpf`. CPU mode only ticks while the process is on CPU; a service that is mostly `.await`ing looks idle until you pass `--event wall`.
 
 `thread` without flags is the CPU table. `thread --n 3`, `thread <tid>`, and `thread --all` interrupt those threads with SIGURG and print a native stack (most recent frame first, like Arthas). A thread that is asleep may not respond; `--full` keeps tokio/std/pthread frames.
 
