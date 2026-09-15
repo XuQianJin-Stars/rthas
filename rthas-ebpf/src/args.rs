@@ -80,11 +80,14 @@ rthas eBPF attach (uninstrumented process)
   stop                           detach and exit this helper
   pwd / sysenv / memory / session / version / jvm
                                  target process snapshot via /proc
+  dashboard [opts]               live OS overview (--interval F, --count N, --n N)
+  thread [opts]                  /proc/<pid>/task table (--n N, --state S, <tid>)
+                                 (no native stacks)
   <cmd> | grep|tee|wc            in-process pipes (same flags as the library)
   ping / help
 
 No Debug args/return values. Async call trees are not reliable.
-stack/tt/dashboard/thread/profiler/sysprop are not available on eBPF attach.
+stack/tt/profiler/sysprop are not available on eBPF attach.
 ";
 
 pub fn handle_client<F>(stream: UnixStream, mut dispatch: F) -> std::io::Result<()>
@@ -157,6 +160,8 @@ mod tests {
         assert!(HELP.contains("monitor <pattern>"));
         assert!(HELP.contains("pwd / sysenv"));
         assert!(HELP.contains("<cmd> | grep"));
+        assert!(HELP.contains("dashboard [opts]"));
+        assert!(HELP.contains("thread [opts]"));
         assert!(!HELP.contains("stack/tt/monitor/stats"));
     }
 }

@@ -221,7 +221,12 @@ impl Snapshot {
         }
     }
 
-    fn from_wall(stacks: Vec<(Vec<String>, i64)>, raw_samples: i64, elapsed: Duration, hz: i32) -> Self {
+    fn from_wall(
+        stacks: Vec<(Vec<String>, i64)>,
+        raw_samples: i64,
+        elapsed: Duration,
+        hz: i32,
+    ) -> Self {
         let mut stacks = stacks;
         stacks.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         Self {
@@ -236,6 +241,20 @@ impl Snapshot {
 
     pub fn total(&self) -> i64 {
         self.stacks.iter().map(|(_, n)| *n).sum()
+    }
+
+    /// Keep stacks that hit `--include` and drop those that hit `--exclude`.
+    ///
+    /// Either flag is a comma-separated glob list. Empty include means keep
+    /// everything. Clearing `report` forces the SVG path through the filtered
+    /// stacks instead of the unfiltered pprof dump.
+    pub fn filter(mut self, include: &str, exclude: &str) -> Self {
+        if include.is_empty() && exclude.is_empty() {
+            return self;
+        }
+        self.stacks = filter_stacks(self.stacks, include, exclude);
+        self.report = None;
+        self
     }
 
     pub fn render_text(&self, depth: usize, top_n: usize, compact: bool) -> String {
@@ -471,6 +490,34 @@ fn collect_self(node: &Node, path: &mut Vec<String>, out: &mut Vec<(i64, String)
     }
 }
 
+/// Keep a stack if any frame matches `include` (or include is empty) and no
+/// frame matches `exclude`.
+pub fn filter_stacks(
+    stacks: Vec<(Vec<String>, i64)>,
+    include: &str,
+    exclude: &str,
+) -> Vec<(Vec<String>, i64)> {
+    let include = split_patterns(include);
+    let exclude = split_patterns(exclude);
+    stacks
+        .into_iter()
+        .filter(|(stack, _)| {
+            let hit = |pats: &[&str]| {
+                pats.iter()
+                    .any(|p| stack.iter().any(|f| crate::probe::glob_match(p, f)))
+            };
+            (include.is_empty() || hit(&include)) && (exclude.is_empty() || !hit(&exclude))
+        })
+        .collect()
+}
+
+fn split_patterns(raw: &str) -> Vec<&str> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 pub fn render_collapsed(stacks: &[(Vec<String>, i64)]) -> String {
     let mut out = String::new();
     for (stack, n) in stacks {
@@ -601,7 +648,10 @@ fn set_itimer_real(hz: i32) -> libc::c_int {
         (0, 0)
     } else {
         let us = 1_000_000 / i64::from(hz.max(1));
-        ((us / 1_000_000) as libc::time_t, (us % 1_000_000) as libc::suseconds_t)
+        (
+            (us / 1_000_000) as libc::time_t,
+            (us % 1_000_000) as libc::suseconds_t,
+        )
     };
     let mut it = libc::itimerval {
         it_interval: libc::timeval {
@@ -704,6 +754,16 @@ mod tests {
         let folded = render_collapsed(&sample_stacks());
         assert!(folded.contains("main;handle_request;lookup 7"));
         assert!(folded.contains("main;handle_request;read_block 3"));
+    }
+
+    #[test]
+    fn include_and_exclude_filter_stacks() {
+        let stacks = super::filter_stacks(sample_stacks(), "lookup", "");
+        assert_eq!(stacks.len(), 1);
+        assert!(stacks[0].0.iter().any(|f| f == "lookup"));
+        let stacks = super::filter_stacks(sample_stacks(), "", "read_block");
+        assert_eq!(stacks.len(), 1);
+        assert!(!stacks[0].0.iter().any(|f| f == "read_block"));
     }
 
     #[test]

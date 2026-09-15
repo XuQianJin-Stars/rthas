@@ -96,11 +96,11 @@ PROCESS:
                                     Ctrl-C (--interval F, --count N, --n N)
     thread [opts]                   per-thread CPU and last recorded span
                                     (--n N dumps top N native stacks,
-                                    --all / <tid> / --stack)
+                                    --all / <tid> / --stack / --state S)
     profiler [start|stop|status]    sampling (--event cpu|wall; cpu=SIGPROF,
                                     wall=ITIMER_REAL). --seconds F, --hz N,
                                     --format text|collapsed|flamegraph,
-                                    --file PATH, --full)
+                                    --file PATH, --include P, --exclude P, --full)
     memory                          OS memory: rss / virt / threads / fds
     jvm                             runtime snapshot (os / rustc / features)
     sysprop [NAME]                  read-only knobs (`os`, `rustc`, `rthas`)
@@ -128,6 +128,7 @@ EXAMPLES:
     rthas stack read_block --native --count 2
     rthas dashboard --interval 0.5
     rthas thread --by cpu --n 3
+    rthas thread --state sleeping
     rthas profiler --seconds 5
     rthas profiler --seconds 5 --event wall
     rthas top --n 5 --by max
@@ -140,6 +141,7 @@ EXAMPLES:
     rthas list \\| grep handle
     rthas --password secret session
     rthas -c 'jvm' --pid 1234
+    rthas help watch
 ";
 
 /// Accept `rthas --pid 5 list` as a synonym of `rthas list --pid 5`.
@@ -174,7 +176,17 @@ fn main() {
     }
 
     match argv[0].as_str() {
-        "-h" | "--help" | "help" => print!("{USAGE}"),
+        "-h" | "--help" => print!("{USAGE}"),
+        "help" => {
+            if argv.get(1).map(|s| !s.starts_with('-')).unwrap_or(false) {
+                if let Err(e) = cmd_remote("help", &argv[1..]) {
+                    eprintln!("rthas: {e}");
+                    std::process::exit(1);
+                }
+            } else {
+                print!("{USAGE}");
+            }
+        }
         "ps" => {
             let args = &argv[1..];
             let all = args.iter().any(|a| a == "--all");

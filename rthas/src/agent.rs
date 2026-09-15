@@ -54,7 +54,18 @@ static LAZY_WATCHING: AtomicBool = AtomicBool::new(false);
 
 /// Flags that never consume the next token (`--native --count 5`).
 const VALUELESS_FLAGS: &[&str] = &[
-    "native", "list", "clear", "full", "all", "stack", "d", "decode", "c",
+    "native",
+    "list",
+    "clear",
+    "full",
+    "all",
+    "stack",
+    "d",
+    "decode",
+    "c",
+    "error",
+    "success",
+    "exception",
 ];
 
 /// Where this process's control socket lives.
@@ -337,7 +348,11 @@ fn dispatch_verb<W: Write>(line: &str, out: &mut W, authed: &mut bool) -> std::i
 
     match verb {
         "help" | "?" => {
-            out.write_all(HELP.as_bytes())?;
+            write!(
+                out,
+                "{}",
+                command_help(args.pos.get(1).copied().unwrap_or(""))
+            )?;
         }
         "ping" => {
             writeln!(
@@ -418,6 +433,61 @@ fn dispatch_verb<W: Write>(line: &str, out: &mut W, authed: &mut bool) -> std::i
     Ok(true)
 }
 
+fn command_help(name: &str) -> String {
+    if name.is_empty() {
+        return HELP.to_string();
+    }
+    let key = match name {
+        "sm" => "list",
+        "runtime" => "jvm",
+        "vmoption" => "options",
+        "?" => "help",
+        "q" | "exit" => "quit",
+        other => other,
+    };
+    let mut out = String::new();
+    let mut taking = false;
+    for line in HELP.lines() {
+        let is_cmd = line.starts_with("  ") && !line.starts_with("   ");
+        if is_cmd {
+            if taking {
+                break;
+            }
+            taking = usage_covers(line.trim_start(), key);
+            if taking {
+                out.push_str(line);
+                out.push('\n');
+            }
+            continue;
+        }
+        if taking {
+            if !line.starts_with(' ') && !line.is_empty() {
+                break;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if out.is_empty() {
+        format!("unknown command '{name}'. try 'help'\n")
+    } else {
+        out
+    }
+}
+
+fn usage_covers(rest: &str, key: &str) -> bool {
+    let usage = rest.split("  ").next().unwrap_or(rest);
+    usage.split(|c| c == '/' || c == '|').any(|part| {
+        let tok = part
+            .trim()
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_matches(|c: char| matches!(c, '<' | '>' | '[' | ']'));
+        tok == key
+    })
+}
+
 const HELP: &str = "\
 rthas control commands
   list [pattern] / sm [pattern]         enumerate instrumented functions
@@ -432,6 +502,7 @@ rthas control commands
      --count N        stop after N calls (default 50, 0 = until Ctrl-C)
      --args S         only calls whose arguments contain S
      --ret S          only calls whose return value contains S
+     --error / --success   only Err / only Ok (Arthas -e / -s)
   stack <pattern> [opts]                call path that reached each matching call
      --count N        stop after N trees (default 5, 0 = until Ctrl-C)
      --native         also symbolise the native stack captured on entry
@@ -446,6 +517,7 @@ rthas control commands
      <tid>            native stack of one thread
      --stack          dump stacks for the listed rows
      --by tid|cpu|name                  sort order (default tid; cpu when dumping)
+     --state running|sleeping|disk|stopped|zombie
      --full           keep tokio/std/pthread frames
      --interval F     wait for dump signals (default 0.15s)
      --depth N        stack frames shown (default 16)
@@ -460,6 +532,7 @@ rthas control commands
      --format text|collapsed|flamegraph   stop output (default text)
      --file PATH      also write the report to PATH
      --n N / --depth N   hottest frames / tree depth
+     --include P / --exclude P   keep / drop stacks matching glob (comma list)
      --full           keep tokio/std/pthread frames in the text tree
   stats [pattern]                       p50/p95/p99/max over the ring buffer
   top [pattern] [--n N] [--by total|max|count]   slowest / hottest functions
@@ -491,6 +564,7 @@ rthas control commands
   reset                                 disable all probes (Arthas reset)
   stop                                  unbind the agent; `rthas attach` restarts it
   clear                                 drop buffered events
+  help [command]                        this page, or one command (help watch)
   quit                                  close this session
 
 patterns are glob-ish: `*` is a wildcard, a pattern without `*` matches by
@@ -675,6 +749,8 @@ fn cmd_watch<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
     let seconds: f64 = args.num("seconds", 0.0);
     let args_filter = args.get("args").unwrap_or("");
     let ret_filter = args.get("ret").unwrap_or("");
+    let error = args.flag("error") || args.flag("exception");
+    let success = args.flag("success");
 
     if registry()
         .all()
@@ -701,6 +777,9 @@ fn cmd_watch<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
             if !matches_filters(&event, args_filter, ret_filter) {
                 continue;
             }
+            if !keep_outcome(event.ok, error, success) {
+                continue;
+            }
             out.write_all(render_flat(&event).as_bytes())?;
             out.write_all(b"\n")?;
             printed += 1;
@@ -725,6 +804,14 @@ fn cmd_watch<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
 fn matches_filters(e: &Event, args_filter: &str, ret_filter: &str) -> bool {
     (args_filter.is_empty() || e.args.contains(args_filter))
         && (ret_filter.is_empty() || e.ret.contains(ret_filter))
+}
+
+fn keep_outcome(ok: bool, error: bool, success: bool) -> bool {
+    match (error, success) {
+        (true, false) => !ok,
+        (false, true) => ok,
+        _ => true,
+    }
 }
 
 struct Agg {
@@ -1074,6 +1161,17 @@ fn render_dashboard(
 // thread: per-thread CPU plus the last span each thread recorded
 // ---------------------------------------------------------------------------
 
+fn normalize_thread_state(s: &str) -> &'static str {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "r" | "running" | "runnable" => "running",
+        "s" | "sleeping" | "waiting" | "timed_waiting" | "timed-waiting" => "sleeping",
+        "d" | "disk" | "blocked" | "uninterruptible" => "disk",
+        "t" | "stopped" => "stopped",
+        "z" | "zombie" | "terminated" => "zombie",
+        _ => "",
+    }
+}
+
 fn cmd_thread<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
     let tid_arg = args.pos.get(1).and_then(|s| s.parse::<u64>().ok());
     let all = args.flag("all");
@@ -1084,6 +1182,7 @@ fn cmd_thread<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
     let compact = !args.flag("full");
     let wait = Duration::from_secs_f64(args.num("interval", 0.15f64).max(0.02));
     let depth = args.num("depth", 16usize);
+    let state = args.get("state").unwrap_or("");
 
     let mut rows = thread_rows();
 
@@ -1110,7 +1209,22 @@ fn cmd_thread<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
             writeln!(out, "no thread with tid {tid}")?;
             return Ok(());
         }
-    } else if limit > 0 {
+    }
+    if !state.is_empty() {
+        let want = normalize_thread_state(state);
+        rows.retain(|t| {
+            if want.is_empty() {
+                t.state.eq_ignore_ascii_case(state)
+            } else {
+                t.state == want
+            }
+        });
+        if rows.is_empty() {
+            writeln!(out, "no threads in state {state}")?;
+            return Ok(());
+        }
+    }
+    if tid_arg.is_none() && limit > 0 {
         rows.truncate(limit);
     }
 
@@ -1212,9 +1326,13 @@ fn cmd_profiler<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
         }
     };
     let compact = !full && event == crate::profiler::EventKind::Cpu;
+    let include = args.get("include").unwrap_or("");
+    let exclude = args.get("exclude").unwrap_or("");
 
     if seconds > 0.0 && matches!(action, "" | "start") {
-        return profiler_oneshot(seconds, hz, event, format, file, top_n, depth, compact, out);
+        return profiler_oneshot(
+            seconds, hz, event, format, file, top_n, depth, compact, include, exclude, out,
+        );
     }
 
     match action {
@@ -1237,7 +1355,7 @@ fn cmd_profiler<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
             ),
             Err(e) => writeln!(out, "{e}"),
         },
-        "stop" => profiler_dump(format, file, top_n, depth, compact, out),
+        "stop" => profiler_dump(format, file, top_n, depth, compact, include, exclude, out),
         "status" => writeln!(out, "{}", crate::profiler::status_line()),
         "getSamples" | "getsamples" | "get-samples" | "samples" => {
             match crate::profiler::sample_count() {
@@ -1261,6 +1379,8 @@ fn profiler_oneshot<W: Write>(
     top_n: usize,
     depth: usize,
     compact: bool,
+    include: &str,
+    exclude: &str,
     out: &mut W,
 ) -> std::io::Result<()> {
     if crate::profiler::is_running() {
@@ -1279,7 +1399,7 @@ fn profiler_oneshot<W: Write>(
     )?;
     let _ = out.flush();
     std::thread::sleep(Duration::from_secs_f64(seconds.max(0.05)));
-    profiler_dump(format, file, top_n, depth, compact, out)
+    profiler_dump(format, file, top_n, depth, compact, include, exclude, out)
 }
 
 fn profiler_dump<W: Write>(
@@ -1288,10 +1408,12 @@ fn profiler_dump<W: Write>(
     top_n: usize,
     depth: usize,
     compact: bool,
+    include: &str,
+    exclude: &str,
     out: &mut W,
 ) -> std::io::Result<()> {
     let snap = match crate::profiler::stop() {
-        Ok(s) => s,
+        Ok(s) => s.filter(include, exclude),
         Err(e) => {
             writeln!(out, "{e}")?;
             return Ok(());
@@ -2202,7 +2324,10 @@ pub fn init_lazy() {
 
 #[cfg(test)]
 mod tests {
-    use super::{cmd_jvm, cmd_sysprop, matches_filters, secrets_match, sysenv_entries, Args};
+    use super::{
+        cmd_jvm, cmd_sysprop, command_help, keep_outcome, matches_filters, normalize_thread_state,
+        secrets_match, sysenv_entries, Args,
+    };
     use crate::event::Event;
 
     #[test]
@@ -2292,6 +2417,34 @@ mod tests {
         assert!(matches_filters(&e, "a=1", ""));
         assert!(!matches_filters(&e, "a=2", ""));
         assert!(!matches_filters(&e, "", "Ok(3)"));
+        assert!(keep_outcome(true, false, true));
+        assert!(!keep_outcome(true, true, false));
+        assert!(keep_outcome(false, true, false));
+    }
+
+    #[test]
+    fn help_extracts_one_command() {
+        let watch = command_help("watch");
+        assert!(watch.contains("--args S"));
+        assert!(watch.contains("--error / --success"));
+        assert!(!watch.contains("dashboard [opts]"));
+        assert!(command_help("sm").contains("list [pattern]"));
+        assert!(command_help("nope").contains("unknown command"));
+    }
+
+    #[test]
+    fn thread_state_aliases() {
+        assert_eq!(normalize_thread_state("RUNNABLE"), "running");
+        assert_eq!(normalize_thread_state("timed_waiting"), "sleeping");
+        assert_eq!(normalize_thread_state("blocked"), "disk");
+        assert_eq!(normalize_thread_state("mystery"), "");
+    }
+
+    #[test]
+    fn error_flag_does_not_swallow_count() {
+        let a = Args::parse("watch foo --error --count 3");
+        assert!(a.flag("error"));
+        assert_eq!(a.num("count", 0usize), 3);
     }
 
     #[test]

@@ -29,7 +29,7 @@ Java gets [Arthas](https://github.com/alibaba/arthas) because the JVM can rewrit
 | `history` / `cls` / `base64` / batch `-f` | telnet / as.sh | in-process history; CLI `-f` / `-c` | ✅ | ✅ implemented |
 | Restart-free attach to an **instrumented** process | Attach API | trigger file wakes a deferred agent | ✅ | ✅ implemented |
 | `profiler` flame graph | async-profiler | SIGPROF (cpu) / ITIMER_REAL (wall) | ✅ | ✅ start / stop / status (`--event cpu\|wall`) |
-| Restart-free attach to an **un-instrumented** process | Attach API | eBPF uprobe only (Linux + root + symbols) | ⚠️ | ✅ `attach --ebpf` (`trace`/`watch`/`stats`/`top`/`monitor` + `/proc` sysenv/memory/jvm; no Debug args) |
+| Restart-free attach to an **un-instrumented** process | Attach API | eBPF uprobe only (Linux + root + symbols) | ⚠️ | ✅ `attach --ebpf` (`trace`/`watch`/`stats`/`top`/`monitor`/`dashboard`/`thread` + `/proc`; no Debug args, no native stacks) |
 | `jad` / `redefine` / `retransform` / `dump` / `mc` / `classloader` | runtime class redefinition | impossible (machine code is not rewritable) | ❌ | — |
 | `ognl` / `getstatic` / `heapdump` / `mbean` / `jfr` / `vmtool` | JVM object model | no VM heap or bytecode | ❌ | — |
 | `logger` / `perfcounter` / web-console / HTTP API | JVM / Spring / telnet UI | no JVM logger, JMX beans, or HTTP server | ❌ | — |
@@ -38,7 +38,7 @@ Java gets [Arthas](https://github.com/alibaba/arthas) because the JVM can rewrit
 `attach` splits in two, and each half takes its own route:
 
 - **The instrumented half is done**: as long as the binary carries `#[rthas::trace]`, you can take it over while it runs — no restart, no recompile, no root, on both Linux and macOS. See [Attaching](#attaching-to-a-running-process).
-- **The un-instrumented half is Linux-only**: `rthas attach --ebpf <pid>` loads uprobes from outside the process. It needs a Linux kernel (5.5+), root or `CAP_BPF`, and a binary that still has symbols. You get function names and latency via `trace` / `watch` / `stats` / `top` / `monitor`; there are no `Debug` arguments, and async call trees will fragment. See [eBPF attach](#ebpf-attach-uninstrumented-processes).
+- **The un-instrumented half is Linux-only**: `rthas attach --ebpf <pid>` loads uprobes from outside the process. It needs a Linux kernel (5.5+), root or `CAP_BPF`, and a binary that still has symbols. You get function names and latency via `trace` / `watch` / `stats` / `top` / `monitor`, plus `dashboard` / `thread` from `/proc`; there are no `Debug` arguments, and async call trees will fragment. See [eBPF attach](#ebpf-attach-uninstrumented-processes).
 
 ### About `stack`
 
@@ -153,7 +153,7 @@ cargo run --bin rthas -- shell
 | `list [pattern]` | Enumerate instrumented functions |
 | `on <pattern>` / `off [pattern]` | Toggle probes (off by default) |
 | `trace <pattern> [--count N] [--seconds F] [--depth N] [--min-ms F] [--grace-ms N]` | Stream call trees |
-| `watch <pattern> [--args S] [--ret S] [--count N]` | One line per call |
+| `watch <pattern> [--args S] [--ret S] [--error] [--success] [--count N]` | One line per call (`--error` / `--success` = Arthas `-e` / `-s`) |
 | `stack <pattern> [--native] [--count N] [--depth N]` | Call path that reached each matching call |
 | `stats [pattern]` | p50 / p95 / p99 / max (in-process: ring; eBPF: attach for `--seconds`, default 3s) |
 | `top [pattern] [--n N] [--by total\|max\|count]` | Hottest or slowest functions |
@@ -161,8 +161,8 @@ cargo run --bin rthas -- shell
 | `tt <pattern> [--count N] [--args S] [--ret S]` | Record calls into the time tunnel |
 | `tt --list [pattern]` / `tt --index N` / `tt --delete N` / `tt --clear` | List / inspect / drop fragments (no `tt -p` replay) |
 | `dashboard [--interval F] [--count N] [--n N]` | Live process overview, refreshes until Ctrl-C |
-| `thread [--n N] [--by tid\|cpu\|name] [<tid>] [--all]` | Per-thread CPU + last span; `--n` / `<tid>` / `--all` dump native stacks |
-| `profiler start\|stop\|status` | Sampling. `--event cpu` (default, SIGPROF) or `wall` (ITIMER_REAL). `--seconds F`; `--format text\|collapsed\|flamegraph` |
+| `thread [--n N] [--by tid\|cpu\|name] [<tid>] [--all] [--state S]` | Per-thread CPU + last span; `--n` / `<tid>` / `--all` dump native stacks (in-process only) |
+| `profiler start\|stop\|status` | Sampling. `--event cpu` (default, SIGPROF) or `wall` (ITIMER_REAL). `--seconds F`; `--include`/`--exclude`; `--format text\|collapsed\|flamegraph` |
 | `memory` | OS memory: rss / virt / threads / fds |
 | `jvm` (`runtime`) | Process snapshot: os / arch / rustc / features / memory |
 | `sysprop [NAME]` | Read-only knobs (`os`, `rustc`, `rthas`); no `System.setProperty` |
@@ -183,7 +183,7 @@ cargo run --bin rthas -- shell
 | `reset` | Disable all probes |
 | `stop` | Unbind the agent; `rthas attach <pid>` restarts it |
 | `clear` | Drop buffered events |
-| `help` | Full reference |
+| `help [command]` | Full reference, or one command (`help watch`) |
 
 Patterns use shell-style globbing: `*` is wildcard, no-`*` matches by substring. So `get_status` finds `goosefs_sdk::client::master::MasterClient::get_status`. A pattern *with* a `*` is tried at every position, so `MasterClient::*` finds it too.
 
@@ -216,9 +216,9 @@ Stopped [cpu] profiling. samples=280 elapsed=3.0s hz=99
    21.4%      60    example_app::lookup_metadata
 ```
 
-Sampling uses SIGPROF (`pprof`) for `--event cpu` (the default) and ITIMER_REAL / SIGALRM for `--event wall`. Nothing is installed until `profiler start` or `--seconds`. The CPU text tree omits tokio / std / pthread frames so your functions surface (`--full` keeps them); wall keeps those frames so you can see park / poll. Wall samples the thread that receives SIGALRM each tick (often the runtime park thread), not every worker. `--format collapsed` is input for speedscope / `flamegraph.pl`; `--format flamegraph` writes an SVG (`--file` or `/tmp/rthas-<pid>.svg`). This is a **native** stack sample — async work shows up as `poll`, not as the logical request. Use `trace` for that. Not available on `attach --ebpf`. CPU mode only ticks while the process is on CPU; a service that is mostly `.await`ing looks idle until you pass `--event wall`.
+Sampling uses SIGPROF (`pprof`) for `--event cpu` (the default) and ITIMER_REAL / SIGALRM for `--event wall`. Nothing is installed until `profiler start` or `--seconds`. `--include` / `--exclude` are comma-separated globs matched against any frame in a sample (`profiler --seconds 3 --include crunch --exclude tokio`). The CPU text tree omits tokio / std / pthread frames so your functions surface (`--full` keeps them); wall keeps those frames so you can see park / poll. Wall samples the thread that receives SIGALRM each tick (often the runtime park thread), not every worker. `--format collapsed` is input for speedscope / `flamegraph.pl`; `--format flamegraph` writes an SVG (`--file` or `/tmp/rthas-<pid>.svg`). This is a **native** stack sample — async work shows up as `poll`, not as the logical request. Use `trace` for that. Not available on `attach --ebpf`. CPU mode only ticks while the process is on CPU; a service that is mostly `.await`ing looks idle until you pass `--event wall`.
 
-`thread` without flags is the CPU table. `thread --n 3`, `thread <tid>`, and `thread --all` interrupt those threads with SIGURG and print a native stack (most recent frame first, like Arthas). A thread that is asleep may not respond; `--full` keeps tokio/std/pthread frames.
+`thread` without flags is the CPU table. `thread --n 3`, `thread <tid>`, and `thread --all` interrupt those threads with SIGURG and print a native stack (most recent frame first, like Arthas). `thread --state running` (also `sleeping` / `disk` / `stopped` / `zombie`, plus JVM names like `RUNNABLE`) keeps one OS state. A thread that is asleep may not respond; `--full` keeps tokio/std/pthread frames. On eBPF attach the table comes from `/proc/<pid>/task` and there are no native stacks.
 
 Platform differences: `/proc` gives exact per-thread CPU deltas (Linux), while Mach only reports an instantaneous occupancy ratio (macOS), and on macOS the RSS figure is the `getrusage` peak rather than the current value. `--by cpu` is therefore an instantaneous reading on macOS; every other field is identical.
 
@@ -290,6 +290,8 @@ rthas watch handle_request --count 5
 rthas stats handle_request --seconds 3
 rthas top handle_request --n 10
 rthas monitor handle_request --interval 1 --count 3
+rthas dashboard --count 1 --pid 1234
+rthas thread --pid 1234
 rthas stop --pid 1234
 ```
 
@@ -297,7 +299,8 @@ Limits, on purpose:
 
 - Function **name + latency** only. No `Debug` arguments or return values
   (`--args` / `--ret` are ignored). `stats` / `top` / `monitor` work, but
-  ERR / fail-rate are always 0.
+  ERR / fail-rate are always 0. `dashboard` / `thread` read `/proc/<pid>`
+  (no native stacks, no last-span column).
 - At most 64 symbols per `trace`/`watch`/`stats`/`top`/`monitor`. `std::` /
   `core::` / `alloc::` are skipped unless the pattern names them.
 - Async call trees fragment: a uretprobe fires when `poll` returns, not when

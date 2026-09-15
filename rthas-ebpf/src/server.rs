@@ -130,6 +130,8 @@ mod linux {
             "session" => cmd_session(pid, symbols.len(), out)?,
             "version" => writeln!(out, "rthas-ebpf {}", env!("CARGO_PKG_VERSION"))?,
             "jvm" | "runtime" => cmd_jvm(pid, out)?,
+            "dashboard" => cmd_dashboard(pid, &args, symbols, biases, bpf, out)?,
+            "thread" => cmd_thread(pid, &args, out)?,
             "stop" => {
                 bpf.detach();
                 stop.store(true, Ordering::SeqCst);
@@ -140,8 +142,7 @@ mod linux {
                 writeln!(out, "bye")?;
                 return Ok(false);
             }
-            "stack" | "tt" | "dashboard" | "thread" | "sysprop" | "options" | "reset" | "clear"
-            | "profiler" => {
+            "stack" | "tt" | "sysprop" | "options" | "reset" | "clear" | "profiler" => {
                 writeln!(out, "{verb} is not available on eBPF attach")?;
             }
             other => writeln!(out, "unknown command '{other}'. try 'help'")?,
@@ -470,6 +471,211 @@ mod linux {
             }
         }
         out
+    }
+
+    fn cmd_dashboard<W: Write>(
+        pid: u32,
+        args: &Args,
+        symbols: &[Symbol],
+        biases: &[(PathBuf, u64)],
+        bpf: &mut BpfEngine,
+        out: &mut W,
+    ) -> std::io::Result<()> {
+        let interval = Duration::from_secs_f64(args.num("interval", 1.0f64).max(0.05));
+        let max_frames = args.num("count", 0usize);
+        let seconds: f64 = args.num("seconds", 0.0);
+        let hottest = args.num("n", 5usize);
+        let deadline = (seconds > 0.0).then(|| Instant::now() + Duration::from_secs_f64(seconds));
+        let hz = clk_tck();
+        let enabled: Vec<usize> = symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.enabled)
+            .map(|(i, _)| i)
+            .take(MAX_ATTACH)
+            .collect();
+        let names: Vec<String> = symbols.iter().map(|s| s.demangled.clone()).collect();
+        let attached = if enabled.is_empty() {
+            false
+        } else {
+            match bpf.attach(&enabled, symbols, biases) {
+                Ok(()) => true,
+                Err(e) => {
+                    writeln!(
+                        out,
+                        "dashboard: uprobe attach failed ({e}); OS metrics only"
+                    )?;
+                    false
+                }
+            }
+        };
+        let mut prev_ticks = read_cpu_ticks(pid);
+        let mut prev_at = Instant::now();
+        let mut forest = Forest::new();
+        let mut frames = 0usize;
+        loop {
+            std::thread::sleep(interval);
+            let mut batch = Vec::new();
+            if attached {
+                batch.extend(ingest(bpf, &mut forest));
+            }
+            let now = Instant::now();
+            let ticks = read_cpu_ticks(pid);
+            let wall_ns = now.saturating_duration_since(prev_at).as_nanos().max(1) as f64;
+            let used_ns = proc::ticks_to_ns(ticks.saturating_sub(prev_ticks), hz) as f64;
+            prev_ticks = ticks;
+            prev_at = now;
+            let mem = std::fs::read_to_string(format!("/proc/{pid}/status"))
+                .map(|s| proc::parse_status_memory(&s))
+                .unwrap_or_default();
+            let load1 = std::fs::read_to_string("/proc/loadavg")
+                .map(|s| proc::parse_loadavg(&s))
+                .unwrap_or(0.0);
+            let uptime = process_uptime(pid, hz);
+            let activity = if batch.is_empty() {
+                "  probe activity\n    (nothing this interval — `on <pattern>` then dashboard again)\n"
+                    .to_string()
+            } else {
+                let mut text = format!(
+                    "  probe activity over the last {:.2}s (ERR always 0)\n",
+                    interval.as_secs_f64()
+                );
+                text.push_str(&stats::render_top(&batch, &names, hottest, "total"));
+                text
+            };
+            let sample = proc::DashSample {
+                pid,
+                cpu: (used_ns / wall_ns).clamp(0.0, 64.0),
+                rss_bytes: mem.rss_bytes,
+                threads: mem.threads,
+                load1,
+                uptime,
+                symbols: symbols.len(),
+                enabled: enabled.len(),
+            };
+            let frame = proc::render_dashboard(&sample, &activity);
+            if out
+                .write_all(frame.as_bytes())
+                .and_then(|_| out.flush())
+                .is_err()
+            {
+                break;
+            }
+            frames += 1;
+            if max_frames > 0 && frames >= max_frames {
+                break;
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                break;
+            }
+        }
+        if attached {
+            bpf.detach();
+        }
+        Ok(())
+    }
+
+    fn cmd_thread<W: Write>(pid: u32, args: &Args, out: &mut W) -> std::io::Result<()> {
+        let tid_arg = args.pos.get(1).and_then(|s| s.parse::<u64>().ok());
+        let limit = args.num("n", 0usize);
+        let by = args.get("by").unwrap_or(if limit > 0 || tid_arg.is_some() {
+            "cpu"
+        } else {
+            "tid"
+        });
+        let state = args.get("state").unwrap_or("");
+        let wait = Duration::from_secs_f64(args.num("interval", 0.15f64).max(0.02));
+        let hz = clk_tck();
+        let before = read_tasks(pid);
+        std::thread::sleep(wait);
+        let after = read_tasks(pid);
+        let wall_ns = wait.as_nanos() as u64;
+        let mut rows = proc::task_rows(&before, &after, wall_ns, hz);
+        match by {
+            "cpu" => rows.sort_by(|a, b| {
+                b.cpu
+                    .partial_cmp(&a.cpu)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            "name" => rows.sort_by(|a, b| a.name.cmp(&b.name)),
+            _ => rows.sort_by_key(|t| t.id),
+        }
+        if let Some(tid) = tid_arg {
+            rows.retain(|t| t.id == tid);
+            if rows.is_empty() {
+                writeln!(out, "no thread with tid {tid}")?;
+                return Ok(());
+            }
+        }
+        rows.retain(|t| proc::state_matches(state, t.state));
+        if !state.is_empty() && rows.is_empty() {
+            writeln!(out, "no threads in state {state}")?;
+            return Ok(());
+        }
+        let total = after.len();
+        if tid_arg.is_none() && limit > 0 {
+            rows.truncate(limit);
+        }
+        write!(out, "{}", proc::render_thread_table(&rows, total))?;
+        if args.flag("all") || args.flag("stack") || tid_arg.is_some() || args.get("n").is_some() {
+            writeln!(out, "native stacks are not available on eBPF attach")?;
+        }
+        Ok(())
+    }
+
+    fn read_tasks(pid: u32) -> Vec<proc::TaskSnap> {
+        let mut out = Vec::new();
+        let Ok(dir) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+            return out;
+        };
+        for entry in dir.flatten() {
+            let tid = match entry.file_name().to_string_lossy().parse::<u64>() {
+                Ok(tid) => tid,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            let name = std::fs::read_to_string(path.join("comm"))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|_| "<unnamed>".into());
+            let (state, cpu_ticks) = std::fs::read_to_string(path.join("stat"))
+                .map(|s| proc::parse_stat_cpu(&s))
+                .unwrap_or(('-', 0));
+            out.push(proc::TaskSnap {
+                id: tid,
+                name: if name.is_empty() {
+                    "<unnamed>".into()
+                } else {
+                    name
+                },
+                state,
+                cpu_ticks,
+            });
+        }
+        out.sort_by_key(|t| t.id);
+        out
+    }
+
+    fn read_cpu_ticks(pid: u32) -> u64 {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map(|s| proc::parse_stat_cpu(&s).1)
+            .unwrap_or(0)
+    }
+
+    fn process_uptime(pid: u32, hz: u64) -> String {
+        let start = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map(|s| proc::parse_start_ticks(&s))
+            .unwrap_or(0);
+        let boot = std::fs::read_to_string("/proc/uptime")
+            .map(|s| proc::parse_uptime_secs(&s))
+            .unwrap_or(0.0);
+        let elapsed = boot - (start as f64 / hz.max(1) as f64);
+        proc::fmt_clock(elapsed.max(0.0) as u64)
+    }
+
+    fn clk_tck() -> u64 {
+        // Linux USER_HZ is 100 on every distro we care about; avoids a libc dep
+        // in the helper crate.
+        100
     }
 
     fn cmd_pwd<W: Write>(pid: u32, out: &mut W) -> std::io::Result<()> {
