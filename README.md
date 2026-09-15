@@ -27,13 +27,13 @@ Java gets [Arthas](https://github.com/alibaba/arthas) because the JVM can rewrit
 | `auth` + pipes (`grep` / `tee` / `wc`) / `pwd` / `cat` | telnet session | `RTHAS_PASSWORD` per connection; in-process pipes | ✅ | ✅ implemented |
 | Restart-free attach to an **instrumented** process | Attach API | trigger file wakes a deferred agent | ✅ | ✅ implemented |
 | `profiler` flame graph | async-profiler | SIGPROF sampling (`pprof`) | ✅ | ✅ start / stop / status (cpu; text + collapsed + svg) |
-| Restart-free attach to an **un-instrumented** process | Attach API | eBPF uprobe only (Linux + root + symbols) | ⚠️ | ✅ `attach --ebpf` (name + latency; no Debug args) |
+| Restart-free attach to an **un-instrumented** process | Attach API | eBPF uprobe only (Linux + root + symbols) | ⚠️ | ✅ `attach --ebpf` (name + latency; `trace`/`watch`/`stats`/`top`/`monitor`; no Debug args) |
 | `jad` decompile / `redefine` hot swap | runtime class redefinition | impossible (machine code is not rewritable) | ❌ | — |
 
 `attach` splits in two, and each half takes its own route:
 
 - **The instrumented half is done**: as long as the binary carries `#[rthas::trace]`, you can take it over while it runs — no restart, no recompile, no root, on both Linux and macOS. See [Attaching](#attaching-to-a-running-process).
-- **The un-instrumented half is Linux-only**: `rthas attach --ebpf <pid>` loads uprobes from outside the process. It needs a Linux kernel (5.5+), root or `CAP_BPF`, and a binary that still has symbols. You get function names and latency via `trace` / `watch`; there are no `Debug` arguments, and async call trees will fragment. See [eBPF attach](#ebpf-attach-uninstrumented-processes).
+- **The un-instrumented half is Linux-only**: `rthas attach --ebpf <pid>` loads uprobes from outside the process. It needs a Linux kernel (5.5+), root or `CAP_BPF`, and a binary that still has symbols. You get function names and latency via `trace` / `watch` / `stats` / `top` / `monitor`; there are no `Debug` arguments, and async call trees will fragment. See [eBPF attach](#ebpf-attach-uninstrumented-processes).
 
 ### About `stack`
 
@@ -146,9 +146,9 @@ cargo run --bin rthas -- shell
 | `trace <pattern> [--count N] [--seconds F] [--depth N] [--min-ms F] [--grace-ms N]` | Stream call trees |
 | `watch <pattern> [--args S] [--ret S] [--count N]` | One line per call |
 | `stack <pattern> [--native] [--count N] [--depth N]` | Call path that reached each matching call |
-| `stats [pattern]` | p50 / p95 / p99 / max over ring buffer |
+| `stats [pattern]` | p50 / p95 / p99 / max (in-process: ring; eBPF: attach for `--seconds`, default 3s) |
 | `top [pattern] [--n N] [--by total\|max\|count]` | Hottest or slowest functions |
-| `monitor [pattern] [--interval F] [--count N] [--seconds F]` | Periodic method stats (total / success / fail / avg-rt / fail-rate) |
+| `monitor [pattern] [--interval F] [--count N] [--seconds F]` | Periodic method stats (eBPF: fail-rate always 0) |
 | `tt <pattern> [--count N] [--args S] [--ret S]` | Record calls into the time tunnel |
 | `tt --list [pattern]` / `tt --index N` / `tt --delete N` / `tt --clear` | List / inspect / drop fragments (no `tt -p` replay) |
 | `dashboard [--interval F] [--count N] [--n N]` | Live process overview, refreshes until Ctrl-C |
@@ -272,15 +272,19 @@ sudo ./target/debug/rthas attach --ebpf 1234
 rthas list --pid 1234
 rthas trace handle_request --count 3
 rthas watch handle_request --count 5
+rthas stats handle_request --seconds 3
+rthas top handle_request --n 10
+rthas monitor handle_request --interval 1 --count 3
 rthas stop --pid 1234
 ```
 
 Limits, on purpose:
 
 - Function **name + latency** only. No `Debug` arguments or return values
-  (`--args` / `--ret` are ignored).
-- At most 64 symbols per `trace`/`watch`. `std::` / `core::` / `alloc::` are
-  skipped unless the pattern names them.
+  (`--args` / `--ret` are ignored). `stats` / `top` / `monitor` work, but
+  ERR / fail-rate are always 0.
+- At most 64 symbols per `trace`/`watch`/`stats`/`top`/`monitor`. `std::` /
+  `core::` / `alloc::` are skipped unless the pattern names them.
 - Async call trees fragment: a uretprobe fires when `poll` returns, not when
   the future completes. Prefer `#[rthas::trace]` for async services.
 - The binary must still have symbols (`strip` makes attach fail).

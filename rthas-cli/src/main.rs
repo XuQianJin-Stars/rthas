@@ -56,7 +56,7 @@ DISCOVERY:
     attach <pid>                    start the agent inside a running process
                                     that deferred it (RTHAS_AGENT=lazy)
     attach --ebpf <pid>             eBPF uprobes (Linux + root + unstripped;
-                                    process need not carry #[rthas::trace])
+                                    trace/watch/stats/top/monitor, no Debug args)
     shell                           interactive session
 
 ATTACHING
@@ -76,7 +76,8 @@ INSPECTION:
                                     --count N, --seconds F)
     stack <pattern> [opts]          call path reaching each matching call
                                     (--native, --count N, --depth N)
-    stats [pattern]                 p50/p95/p99/max over the ring buffer
+    stats [pattern]                 p50/p95/p99/max (in-process: ring;
+                                    eBPF attach: --seconds F, default 3)
     top [pattern] [--n N] [--by total|max|count]
     monitor [pattern] [opts]        periodic method stats (--interval F,
                                     --count N, --seconds F)

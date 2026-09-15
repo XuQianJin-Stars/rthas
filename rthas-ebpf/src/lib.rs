@@ -24,6 +24,7 @@ pub mod event;
 pub mod format;
 pub mod glob;
 pub mod server;
+pub mod stats;
 pub mod symbols;
 pub mod tree;
 
@@ -34,6 +35,9 @@ pub const END: &str = "<<<end>>>";
 pub const MAX_ATTACH: usize = 64;
 pub const DEFAULT_TRACE_COUNT: usize = 20;
 pub const DEFAULT_WATCH_COUNT: usize = 50;
+/// `stats` / `top` on eBPF attach collect for this long when neither
+/// `--seconds` nor `--count` is given (there is no in-process ring to snapshot).
+pub const DEFAULT_STATS_SECONDS: f64 = 3.0;
 
 /// Human-readable reason this helper cannot run on the current OS.
 pub const LINUX_REQUIRED: &str =

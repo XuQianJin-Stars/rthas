@@ -71,11 +71,17 @@ rthas eBPF attach (uninstrumented process)
   trace <pattern> [opts]         call trees from uprobe enter/exit
      --count N / --seconds F / --depth N / --min-ms F
   watch <pattern> [opts]         one line per return (--count N, --seconds F)
+  stats <pattern> [opts]         p50/p95/p99/max over collected returns
+     --seconds F (default 3) / --count N
+  top <pattern> [opts]           hottest / slowest (--n N, --by total|max|count)
+     --seconds F (default 3) / --count N
+  monitor <pattern> [opts]       periodic totals (ERR/fail-rate always 0)
+     --interval F / --count N / --seconds F
   stop                           detach and exit this helper
   ping / help
 
 No Debug args/return values. Async call trees are not reliable.
-stack/tt/monitor/stats/dashboard/memory/jvm/sysprop/profiler are not available on eBPF attach.
+stack/tt/dashboard/memory/jvm/sysprop/profiler are not available on eBPF attach.
 ";
 
 pub fn handle_client<F>(stream: UnixStream, mut dispatch: F) -> std::io::Result<()>
@@ -116,7 +122,7 @@ pub fn bind_socket(path: &PathBuf) -> std::io::Result<UnixListener> {
 
 #[cfg(test)]
 mod tests {
-    use super::Args;
+    use super::{Args, HELP};
 
     #[test]
     fn parses_trace_flags() {
@@ -124,5 +130,13 @@ mod tests {
         assert_eq!(a.pattern(), "handle_request");
         assert_eq!(a.num("count", 0usize), 3);
         assert!((a.num("min-ms", 0.0f64) - 1.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn help_lists_stats_top_monitor() {
+        assert!(HELP.contains("stats <pattern>"));
+        assert!(HELP.contains("top <pattern>"));
+        assert!(HELP.contains("monitor <pattern>"));
+        assert!(!HELP.contains("stack/tt/monitor/stats"));
     }
 }

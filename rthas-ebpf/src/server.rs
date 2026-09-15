@@ -37,8 +37,11 @@ mod linux {
     use crate::event::{KIND_ENTER, KIND_EXIT};
     use crate::format::format_dur;
     use crate::glob::glob_match;
+    use crate::stats::{self, Sample};
     use crate::symbols::{self, Symbol};
     use crate::tree::Forest;
+    use crate::{DEFAULT_TRACE_COUNT, DEFAULT_WATCH_COUNT, MAX_ATTACH};
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     pub fn run(pid: u32, sock_dir: &Path) -> Result<(), String> {
@@ -117,6 +120,9 @@ mod linux {
             }
             "trace" => cmd_stream(&args, symbols, biases, bpf, true, out)?,
             "watch" => cmd_stream(&args, symbols, biases, bpf, false, out)?,
+            "stats" => cmd_stats(&args, symbols, biases, bpf, out)?,
+            "top" => cmd_top(&args, symbols, biases, bpf, out)?,
+            "monitor" => cmd_monitor(&args, symbols, biases, bpf, out)?,
             "stop" => {
                 bpf.detach();
                 stop.store(true, Ordering::SeqCst);
@@ -127,9 +133,8 @@ mod linux {
                 writeln!(out, "bye")?;
                 return Ok(false);
             }
-            "stack" | "tt" | "monitor" | "stats" | "top" | "dashboard" | "thread" | "memory"
-            | "sysenv" | "jvm" | "runtime" | "sysprop" | "session" | "options" | "reset"
-            | "clear" | "version" | "profiler" => {
+            "stack" | "tt" | "dashboard" | "thread" | "memory" | "sysenv" | "jvm" | "runtime"
+            | "sysprop" | "session" | "options" | "reset" | "clear" | "version" | "profiler" => {
                 writeln!(out, "{verb} is not available on eBPF attach")?;
             }
             other => writeln!(out, "unknown command '{other}'. try 'help'")?,
@@ -280,5 +285,183 @@ mod linux {
         let kind = if trees { "call tree(s)" } else { "call(s)" };
         writeln!(out, "\n[{printed} {kind}, uprobes detached]")?;
         Ok(())
+    }
+
+    fn cmd_stats<W: Write>(
+        args: &Args,
+        symbols: &[Symbol],
+        biases: &[(PathBuf, u64)],
+        bpf: &mut BpfEngine,
+        out: &mut W,
+    ) -> std::io::Result<()> {
+        let Some(names) = prepare_attach(args, symbols, biases, bpf, out)? else {
+            return Ok(());
+        };
+        let (max_count, deadline) = snapshot_window(args);
+        writeln!(
+            out,
+            "collecting stats for '{}' (ERR always 0 on eBPF attach)",
+            args.pattern()
+        )?;
+        let _ = out.flush();
+        let samples = collect_samples(bpf, max_count, deadline);
+        bpf.detach();
+        write!(out, "{}", stats::render_stats(&samples, &names))?;
+        Ok(())
+    }
+
+    fn cmd_top<W: Write>(
+        args: &Args,
+        symbols: &[Symbol],
+        biases: &[(PathBuf, u64)],
+        bpf: &mut BpfEngine,
+        out: &mut W,
+    ) -> std::io::Result<()> {
+        let Some(names) = prepare_attach(args, symbols, biases, bpf, out)? else {
+            return Ok(());
+        };
+        let n = args.num("n", 10usize);
+        let by = args.get("by").unwrap_or("total");
+        let (max_count, deadline) = snapshot_window(args);
+        writeln!(
+            out,
+            "collecting top for '{}' (ERR always 0 on eBPF attach)",
+            args.pattern()
+        )?;
+        let _ = out.flush();
+        let samples = collect_samples(bpf, max_count, deadline);
+        bpf.detach();
+        write!(out, "{}", stats::render_top(&samples, &names, n, by))?;
+        Ok(())
+    }
+
+    fn cmd_monitor<W: Write>(
+        args: &Args,
+        symbols: &[Symbol],
+        biases: &[(PathBuf, u64)],
+        bpf: &mut BpfEngine,
+        out: &mut W,
+    ) -> std::io::Result<()> {
+        let Some(names) = prepare_attach(args, symbols, biases, bpf, out)? else {
+            return Ok(());
+        };
+        let interval = Duration::from_secs_f64(args.num("interval", 5.0f64).max(0.05));
+        let max_frames = args.num("count", 0usize);
+        let seconds: f64 = args.num("seconds", 0.0);
+        let deadline = (seconds > 0.0).then(|| Instant::now() + Duration::from_secs_f64(seconds));
+        let mut forest = Forest::new();
+        let mut frames = 0usize;
+
+        loop {
+            let until = Instant::now() + interval;
+            let mut batch = Vec::new();
+            while Instant::now() < until {
+                if deadline.is_some_and(|d| Instant::now() >= d) {
+                    break;
+                }
+                batch.extend(ingest(bpf, &mut forest));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let frame = stats::render_monitor(&batch, &names, &stats::utc_stamp());
+            if out
+                .write_all(frame.as_bytes())
+                .and_then(|_| out.flush())
+                .is_err()
+            {
+                break;
+            }
+            frames += 1;
+            if max_frames > 0 && frames >= max_frames {
+                break;
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                break;
+            }
+        }
+        bpf.detach();
+        Ok(())
+    }
+
+    fn prepare_attach(
+        args: &Args,
+        symbols: &[Symbol],
+        biases: &[(PathBuf, u64)],
+        bpf: &mut BpfEngine,
+        out: &mut dyn Write,
+    ) -> std::io::Result<Option<Vec<String>>> {
+        let pattern = args.pattern();
+        let ids = match symbols::select_ids(symbols, pattern) {
+            Ok(ids) => ids,
+            Err(e) => {
+                writeln!(out, "{e}")?;
+                return Ok(None);
+            }
+        };
+        if ids.len() == MAX_ATTACH {
+            writeln!(
+                out,
+                "attaching first {MAX_ATTACH} matches (cap); tighten the pattern to see the rest"
+            )?;
+        }
+        if let Err(e) = bpf.attach(&ids, symbols, biases) {
+            writeln!(out, "attach failed: {e}")?;
+            return Ok(None);
+        }
+        Ok(Some(symbols.iter().map(|s| s.demangled.clone()).collect()))
+    }
+
+    fn snapshot_window(args: &Args) -> (usize, Option<Instant>) {
+        let (seconds, max_count) =
+            stats::collect_limit(args.num("seconds", 0.0), args.num("count", 0usize));
+        let deadline = seconds.map(|s| Instant::now() + Duration::from_secs_f64(s));
+        (max_count, deadline)
+    }
+
+    fn collect_samples(
+        bpf: &mut BpfEngine,
+        max_count: usize,
+        deadline: Option<Instant>,
+    ) -> Vec<Sample> {
+        let mut forest = Forest::new();
+        let mut buf = VecDeque::new();
+        loop {
+            for s in ingest(bpf, &mut forest) {
+                if buf.len() == stats::SAMPLE_CAP {
+                    buf.pop_front();
+                }
+                buf.push_back(s);
+            }
+            if max_count > 0 && buf.len() >= max_count {
+                break;
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        buf.into_iter().collect()
+    }
+
+    fn ingest(bpf: &mut BpfEngine, forest: &mut Forest) -> Vec<Sample> {
+        let mut out = Vec::new();
+        for ev in bpf.poll() {
+            let Some(id) = bpf.lookup(ev.ip) else {
+                continue;
+            };
+            if ev.kind == KIND_ENTER {
+                forest.enter(ev.tid, id, ev.ts_ns);
+                continue;
+            }
+            if ev.kind != KIND_EXIT {
+                continue;
+            }
+            if let Some(done) = forest.exit(ev.tid, id, ev.ts_ns) {
+                out.push(Sample {
+                    id: done.node.id,
+                    dur_ns: done.node.dur_ns,
+                });
+            }
+        }
+        out
     }
 }
