@@ -19,7 +19,7 @@ Java gets [Arthas](https://github.com/alibaba/arthas) because the JVM can rewrit
 | `trace` call path + latency | bytecode instrumentation | proc-macro probes | ✅ | ✅ implemented |
 | `watch` args / return value | bytecode instrumentation | proc-macro, reads the real value | ✅ | ✅ implemented |
 | `stack` who called me | JVMTI | in-process span path + native stack | ✅ | ✅ implemented (`--native`) |
-| `dashboard` / `thread` | JMX / JVMTI | self-sampled: `/proc`, Mach, `getrusage` | ✅ | ✅ implemented |
+| `dashboard` / `thread` | JMX / JVMTI | self-sampled: `/proc`, Mach, `getrusage` + SIGURG dump | ✅ | ✅ table + `thread --n` / `<tid>` / `--all` native stacks |
 | `monitor` periodic stats | bytecode instrumentation | ring buffer aggregated per interval | ✅ | ✅ implemented (also in `dashboard`) |
 | `tt` time tunnel | bytecode + object refs | indexed `Debug` snapshots | ✅ | ✅ record / list / inspect (no replay) |
 | `sysenv` / `memory` / `session` / `options` / `version` / `stop` | JMX / agent | process env, OS memory, runtime knobs | ✅ | ✅ implemented |
@@ -108,7 +108,7 @@ cargo run --bin rthas -- top --n 10 --by max
 cargo run --bin rthas -- dashboard --interval 1
 
 # Per-thread CPU and what each thread last did
-cargo run --bin rthas -- thread --by cpu --n 5
+cargo run --bin rthas -- thread --by cpu --n 3
 
 # CPU sample for a few seconds (text tree; --format flamegraph writes SVG)
 cargo run --bin rthas -- profiler --seconds 5
@@ -144,7 +144,7 @@ cargo run --bin rthas -- shell
 | `tt <pattern> [--count N] [--args S] [--ret S]` | Record calls into the time tunnel |
 | `tt --list [pattern]` / `tt --index N` / `tt --delete N` / `tt --clear` | List / inspect / drop fragments (no `tt -p` replay) |
 | `dashboard [--interval F] [--count N] [--n N]` | Live process overview, refreshes until Ctrl-C |
-| `thread [--n N] [--by tid\|cpu\|name]` | Per-thread CPU plus last recorded span |
+| `thread [--n N] [--by tid\|cpu\|name] [<tid>] [--all]` | Per-thread CPU + last span; `--n` / `<tid>` / `--all` dump native stacks |
 | `profiler start\|stop\|status` | CPU sampling (SIGPROF). `--seconds F` one-shot; `--format text\|collapsed\|flamegraph` |
 | `memory` | OS memory: rss / virt / threads / fds |
 | `sysenv [NAME]` | Process environment (read-only) |
@@ -188,6 +188,8 @@ Stopped [cpu] profiling. samples=280 elapsed=3.0s hz=99
 ```
 
 Sampling uses SIGPROF (`pprof`); nothing is installed until `profiler start` or `--seconds`. The text tree omits tokio / std / pthread frames so your functions surface (`--full` keeps them). `--format collapsed` is input for speedscope / `flamegraph.pl`; `--format flamegraph` writes an SVG (`--file` or `/tmp/rthas-<pid>.svg`). This is a **native** stack sample — async work shows up as `poll`, not as the logical request. Use `trace` for that. Not available on `attach --ebpf`. ITIMER_PROF only ticks while the process is on CPU; a service that is mostly `.await`ing looks idle.
+
+`thread` without flags is the CPU table. `thread --n 3`, `thread <tid>`, and `thread --all` interrupt those threads with SIGURG and print a native stack (most recent frame first, like Arthas). A thread that is asleep may not respond; `--full` keeps tokio/std/pthread frames.
 
 Platform differences: `/proc` gives exact per-thread CPU deltas (Linux), while Mach only reports an instantaneous occupancy ratio (macOS), and on macOS the RSS figure is the `getrusage` peak rather than the current value. `--by cpu` is therefore an instantaneous reading on macOS; every other field is identical.
 
@@ -314,6 +316,7 @@ A disabled probe has **zero allocation** and is always branch-predicted taken. A
 │  │  probe.rs     — static sites + registry │ │
 │  │  span.rs      — thread-local stack      │ │
 │  │  sample.rs    — OS metrics: /proc, Mach │ │
+│  │  thread_dump.rs — SIGURG native stacks  │ │
 │  │  profiler.rs  — SIGPROF CPU sampling    │ │
 │  │  time.rs      — monotonic + wall-clock  │ │
 │  └──────────────────────────────────────────┘ │

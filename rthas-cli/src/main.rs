@@ -92,7 +92,8 @@ PROCESS:
     dashboard [opts]                live process overview, refreshes until
                                     Ctrl-C (--interval F, --count N, --n N)
     thread [opts]                   per-thread CPU and last recorded span
-                                    (--n N, --by tid|cpu|name)
+                                    (--n N dumps top N native stacks,
+                                    --all / <tid> / --stack)
     profiler [start|stop|status]    CPU sampling (SIGPROF)
                                     (--seconds F, --hz N,
                                     --format text|collapsed|flamegraph,
@@ -114,7 +115,7 @@ EXAMPLES:
     rthas watch read_block --ret Err
     rthas stack read_block --native --count 2
     rthas dashboard --interval 0.5
-    rthas thread --by cpu --n 5
+    rthas thread --by cpu --n 3
     rthas profiler --seconds 5
     rthas top --n 5 --by max
     rthas monitor handle_request --interval 1 --count 3

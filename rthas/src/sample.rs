@@ -546,6 +546,76 @@ fn mach_state(run_state: libc::integer_t) -> char {
     }
 }
 
+/// Send `sig` to each listed OS thread except `except_tid`.
+///
+/// Used by `thread` dumps: the handler lives in `thread_dump`. Best-effort —
+/// a thread that has already exited, or that is in an uninterruptible wait,
+/// is skipped.
+pub(crate) fn signal_threads(sig: libc::c_int, tids: &[u64], except_tid: u64) -> usize {
+    let want: std::collections::HashSet<u64> =
+        tids.iter().copied().filter(|t| *t != except_tid).collect();
+    if want.is_empty() {
+        return 0;
+    }
+    signal_threads_inner(sig, &want)
+}
+
+#[cfg(target_os = "linux")]
+fn signal_threads_inner(sig: libc::c_int, want: &std::collections::HashSet<u64>) -> usize {
+    let pid = std::process::id() as i64;
+    let mut n = 0;
+    for tid in want {
+        // SAFETY: tgkill of our own pid/tid with a valid signal. ESRCH is fine.
+        let rc = unsafe { libc::syscall(libc::SYS_tgkill, pid, *tid as i64, sig as i64) };
+        if rc == 0 {
+            n += 1;
+        }
+    }
+    n
+}
+
+#[cfg(target_os = "macos")]
+fn signal_threads_inner(sig: libc::c_int, want: &std::collections::HashSet<u64>) -> usize {
+    use std::ptr;
+    let mut n = 0;
+    #[allow(deprecated)]
+    unsafe {
+        let task = libc::mach_task_self();
+        let mut list: libc::thread_act_array_t = ptr::null_mut();
+        let mut count: libc::mach_msg_type_number_t = 0;
+        if libc::task_threads(task, &mut list, &mut count) != libc::KERN_SUCCESS {
+            return 0;
+        }
+        for i in 0..count {
+            let thread: libc::thread_act_t = *list.add(i as usize);
+            let pthread = libc::pthread_from_mach_thread_np(thread);
+            if pthread == 0 {
+                continue;
+            }
+            let mut id: u64 = 0;
+            libc::pthread_threadid_np(pthread, &mut id);
+            if id == 0 || !want.contains(&id) {
+                continue;
+            }
+            if libc::pthread_kill(pthread, sig) == 0 {
+                n += 1;
+            }
+        }
+        let _ = libc::vm_deallocate(
+            task as libc::vm_map_t,
+            list as libc::vm_address_t,
+            (count as libc::vm_size_t)
+                * std::mem::size_of::<libc::thread_act_t>() as libc::vm_size_t,
+        );
+    }
+    n
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn signal_threads_inner(_sig: libc::c_int, _want: &std::collections::HashSet<u64>) -> usize {
+    0
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------

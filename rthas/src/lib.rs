@@ -62,6 +62,7 @@ mod event;
 mod probe;
 mod profiler;
 mod sample;
+mod thread_dump;
 mod span;
 mod time;
 mod tree;

@@ -52,7 +52,7 @@ static STOP: AtomicBool = AtomicBool::new(false);
 static LAZY_WATCHING: AtomicBool = AtomicBool::new(false);
 
 /// Flags that never consume the next token (`--native --count 5`).
-const VALUELESS_FLAGS: &[&str] = &["native", "list", "clear", "full"];
+const VALUELESS_FLAGS: &[&str] = &["native", "list", "clear", "full", "all", "stack"];
 
 /// Where this process's control socket lives.
 ///
@@ -284,8 +284,14 @@ rthas control commands
      --count N        stop after N frames (0 = until Ctrl-C)
      --n N            hottest probes per frame (default 5)
   thread [opts]                         per-thread CPU and last recorded span
-     --n N            show only the top N threads by CPU
-     --by tid|cpu|name                  sort order (default tid)
+     --n N            top N busiest threads, with native stacks (Arthas -n)
+     --all            native stack of every thread
+     <tid>            native stack of one thread
+     --stack          dump stacks for the listed rows
+     --by tid|cpu|name                  sort order (default tid; cpu when dumping)
+     --full           keep tokio/std/pthread frames
+     --interval F     wait for dump signals (default 0.15s)
+     --depth N        stack frames shown (default 16)
   profiler [action] [opts]              CPU sampling (Arthas profiler)
      start            install SIGPROF sampler (default 99 Hz)
      stop             dump the report and uninstall
@@ -902,8 +908,15 @@ fn render_dashboard(
 // ---------------------------------------------------------------------------
 
 fn cmd_thread<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
+    let tid_arg = args.pos.get(1).and_then(|s| s.parse::<u64>().ok());
+    let all = args.flag("all");
+    let want_stack = args.flag("stack") || all || tid_arg.is_some() || args.get("n").is_some();
     let limit = args.num("n", 0usize);
-    let by = args.get("by").unwrap_or("tid");
+    let dump = want_stack;
+    let by = args.get("by").unwrap_or(if dump { "cpu" } else { "tid" });
+    let compact = !args.flag("full");
+    let wait = Duration::from_secs_f64(args.num("interval", 0.15f64).max(0.02));
+    let depth = args.num("depth", 16usize);
 
     let mut rows = thread_rows();
 
@@ -923,7 +936,14 @@ fn cmd_thread<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
         "name" => rows.sort_by(|a, b| a.name.cmp(&b.name)),
         _ => rows.sort_by_key(|t| t.id),
     }
-    if limit > 0 {
+
+    if let Some(tid) = tid_arg {
+        rows.retain(|t| t.id == tid);
+        if rows.is_empty() {
+            writeln!(out, "no thread with tid {tid}")?;
+            return Ok(());
+        }
+    } else if limit > 0 {
         rows.truncate(limit);
     }
 
@@ -936,24 +956,71 @@ fn cmd_thread<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
         return Ok(());
     }
 
-    writeln!(
-        out,
-        "{:>8}  {:<24} {:<10} {:>7}  LAST SPAN",
-        "TID", "NAME", "STATE", "CPU"
-    )?;
+    if !dump {
+        writeln!(
+            out,
+            "{:>8}  {:<24} {:<10} {:>7}  LAST SPAN",
+            "TID", "NAME", "STATE", "CPU"
+        )?;
+        for t in &rows {
+            let span = last.get(&t.id).copied().unwrap_or("-");
+            writeln!(
+                out,
+                "{:>8}  {:<24} {:<10} {:>6.1}%  {}",
+                t.id,
+                truncate(&t.name, 24),
+                t.state,
+                t.cpu * 100.0,
+                span,
+            )?;
+        }
+        writeln!(out, "\n{} of {} thread(s) shown", rows.len(), total)?;
+        return Ok(());
+    }
+
+    let tids: Vec<u64> = rows.iter().map(|t| t.id).collect();
+    let stacks = crate::thread_dump::capture(&tids, wait, compact);
+
     for t in &rows {
         let span = last.get(&t.id).copied().unwrap_or("-");
         writeln!(
             out,
-            "{:>8}  {:<24} {:<10} {:>6.1}%  {}",
+            "\"{}\" Id={} cpu={:.1}% {}  last={span}",
+            t.name,
             t.id,
-            truncate(&t.name, 24),
-            t.state,
             t.cpu * 100.0,
-            span,
+            t.state
         )?;
+        match stacks.get(&t.id) {
+            Some(frames) if !frames.is_empty() => {
+                let shown = if depth == 0 {
+                    frames.len()
+                } else {
+                    frames.len().min(depth)
+                };
+                for frame in frames.iter().take(shown) {
+                    writeln!(out, "    at {frame}")?;
+                }
+                if shown < frames.len() {
+                    writeln!(out, "    ... {} more", frames.len() - shown)?;
+                }
+            }
+            Some(_) if compact => {
+                writeln!(
+                    out,
+                    "    (runtime frames only — pass --full for tokio/std/pthread)"
+                )?;
+            }
+            _ => {
+                writeln!(
+                    out,
+                    "    (no native stack — thread did not respond to SIGURG)"
+                )?;
+            }
+        }
+        writeln!(out)?;
     }
-    writeln!(out, "\n{} of {} thread(s) shown", rows.len(), total)?;
+    writeln!(out, "{} of {} thread(s) shown", rows.len(), total)?;
     Ok(())
 }
 
@@ -1814,6 +1881,13 @@ mod tests {
         assert!(a.flag("list"));
         assert_eq!(a.pattern(), "handle_request");
         assert_eq!(a.get("list"), Some(""));
+    }
+
+    #[test]
+    fn valueless_all_does_not_swallow_n() {
+        let a = Args::parse("thread --all --n 3");
+        assert!(a.flag("all"));
+        assert_eq!(a.get("n"), Some("3"));
     }
 
     #[test]

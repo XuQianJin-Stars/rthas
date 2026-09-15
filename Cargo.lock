@@ -646,6 +646,7 @@ dependencies = [
 name = "rthas"
 version = "0.1.0"
 dependencies = [
+ "backtrace",
  "inventory",
  "libc",
  "pprof",
