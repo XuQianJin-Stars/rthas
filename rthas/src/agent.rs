@@ -22,6 +22,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -52,7 +53,9 @@ static STOP: AtomicBool = AtomicBool::new(false);
 static LAZY_WATCHING: AtomicBool = AtomicBool::new(false);
 
 /// Flags that never consume the next token (`--native --count 5`).
-const VALUELESS_FLAGS: &[&str] = &["native", "list", "clear", "full", "all", "stack"];
+const VALUELESS_FLAGS: &[&str] = &[
+    "native", "list", "clear", "full", "all", "stack", "d", "decode", "c",
+];
 
 /// Where this process's control socket lives.
 ///
@@ -121,6 +124,7 @@ fn handle_client(stream: UnixStream) -> std::io::Result<()> {
         if cmd.is_empty() {
             continue;
         }
+        crate::history::record(cmd);
         let keep_open = dispatch(cmd, &mut writer, &mut authed)?;
         writeln!(writer, "{END}")?;
         writer.flush()?;
@@ -193,8 +197,8 @@ impl<'a> Args<'a> {
 // ---------------------------------------------------------------------------
 
 fn dispatch<W: Write>(line: &str, out: &mut W, authed: &mut bool) -> std::io::Result<bool> {
-    let (cmd, pipes) = crate::pipe::split_pipeline(line);
-    let verb = cmd.split_whitespace().next().unwrap_or("");
+    let spec = crate::jobs::parse_job_line(line);
+    let verb = spec.cmd.split_whitespace().next().unwrap_or("");
     if password_configured() && !*authed && !auth_free(verb) {
         writeln!(
             out,
@@ -202,6 +206,21 @@ fn dispatch<W: Write>(line: &str, out: &mut W, authed: &mut bool) -> std::io::Re
         )?;
         return Ok(true);
     }
+    if spec.background {
+        if crate::jobs::cannot_background(verb) {
+            writeln!(out, "cannot background '{verb}'")?;
+            return Ok(true);
+        }
+        return spawn_background(spec, *authed, out);
+    }
+    if let Some((path, append)) = spec.redirect.clone() {
+        return run_redirected(&spec.cmd, &path, append, out, authed);
+    }
+    dispatch_piped(&spec.cmd, out, authed)
+}
+
+fn dispatch_piped<W: Write>(line: &str, out: &mut W, authed: &mut bool) -> std::io::Result<bool> {
+    let (cmd, pipes) = crate::pipe::split_pipeline(line);
     if pipes.is_empty() {
         return dispatch_verb(&cmd, out, authed);
     }
@@ -215,6 +234,68 @@ fn dispatch<W: Write>(line: &str, out: &mut W, authed: &mut bool) -> std::io::Re
     let keep = dispatch_verb(&cmd, &mut pipe, authed)?;
     pipe.finish()?;
     Ok(keep)
+}
+
+fn spawn_background<W: Write>(
+    spec: crate::jobs::JobSpec,
+    authed: bool,
+    out: &mut W,
+) -> std::io::Result<bool> {
+    let cmd = spec.cmd.clone();
+    let (id, stop, log, append) = crate::jobs::submit(cmd.clone(), spec.redirect);
+    match OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(!append)
+        .open(&log)
+    {
+        Ok(file) => {
+            std::thread::Builder::new()
+                .name(format!("rthas-job-{id}"))
+                .spawn(move || {
+                    let mut w = crate::jobs::StopWrite::new(file, stop.clone());
+                    let mut authed = authed;
+                    let _ = dispatch_piped(&cmd, &mut w, &mut authed);
+                    crate::jobs::finish(id, stop.load(Ordering::SeqCst));
+                })
+                .ok();
+            writeln!(out, "job id  : {id}")?;
+            writeln!(out, "log     : {}", log.display())?;
+            writeln!(out, "kill {id}  to stop; jobs to list")?;
+        }
+        Err(e) => {
+            crate::jobs::finish(id, true);
+            writeln!(out, "job {id}: could not open {}: {e}", log.display())?;
+        }
+    }
+    Ok(true)
+}
+
+fn run_redirected<W: Write>(
+    cmd: &str,
+    path: &str,
+    append: bool,
+    out: &mut W,
+    authed: &mut bool,
+) -> std::io::Result<bool> {
+    match OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(!append)
+        .open(path)
+    {
+        Ok(mut file) => {
+            let keep = dispatch_piped(cmd, &mut file, authed)?;
+            writeln!(out, "wrote {path}")?;
+            Ok(keep)
+        }
+        Err(e) => {
+            writeln!(out, "redirect {path}: {e}")?;
+            Ok(true)
+        }
+    }
 }
 
 fn auth_free(verb: &str) -> bool {
@@ -273,7 +354,7 @@ fn dispatch_verb<W: Write>(line: &str, out: &mut W, authed: &mut bool) -> std::i
         "grep" | "tee" | "wc" => {
             writeln!(out, "{verb} is a pipe. try: <command> | {verb} ...")?;
         }
-        "list" => cmd_list(&args, out)?,
+        "list" | "sm" => cmd_list(&args, out)?,
         "on" => {
             let n = registry().set_enabled_matching(args.pattern(), true);
             writeln!(out, "enabled {n} probe(s) matching '{}'", args.pattern())?;
@@ -303,7 +384,17 @@ fn dispatch_verb<W: Write>(line: &str, out: &mut W, authed: &mut bool) -> std::i
         "memory" => cmd_memory(out)?,
         "version" => writeln!(out, "rthas {}", env!("CARGO_PKG_VERSION"))?,
         "session" => cmd_session(out, *authed)?,
-        "options" => cmd_options(&args, out)?,
+        "options" | "vmoption" => cmd_options(&args, out)?,
+        "jobs" => write!(out, "{}", crate::jobs::render_table())?,
+        "kill" => cmd_kill(&args, out)?,
+        "fg" | "bg" => writeln!(
+            out,
+            "{verb} is not supported; use `jobs` / `kill N` / `cat` the job log"
+        )?,
+        "history" => cmd_history(&args, out)?,
+        "cls" => write!(out, "\x1b[H\x1b[2J")?,
+        "keymap" => out.write_all(KEYMAP.as_bytes())?,
+        "base64" => cmd_base64(&args, out)?,
         "reset" => {
             registry().disable_all();
             writeln!(out, "disabled all probes")?;
@@ -329,7 +420,7 @@ fn dispatch_verb<W: Write>(line: &str, out: &mut W, authed: &mut bool) -> std::i
 
 const HELP: &str = "\
 rthas control commands
-  list [pattern]                        enumerate instrumented functions
+  list [pattern] / sm [pattern]         enumerate instrumented functions
   on <pattern>                          enable probes (they are off by default)
   off [pattern]                         disable probes (no pattern = all)
   trace <pattern> [opts]                stream call trees for matching functions
@@ -389,9 +480,13 @@ rthas control commands
   memory                                OS memory: rss / virt / threads / fds
   version                               rthas library version in this process
   session                               pid, socket, probes, ring, tunnel
-  options [name] [value]                list or set runtime knobs
+  options / vmoption [name] [value]     list or set runtime knobs
   auth [password]                       authenticate this connection (RTHAS_PASSWORD)
   pwd / cat PATH / echo ...             process cwd and files
+  base64 [-d] PATH                      encode / decode a file (2 MiB cap)
+  history [N] / history -c              command history
+  jobs / kill N                         background jobs (`cmd > FILE &`)
+  cls / keymap                          clear screen / keys
   <cmd> | grep PATTERN | tee FILE | wc  pipes (-i -v -n -c -m -A -B -C; tee -a)
   reset                                 disable all probes (Arthas reset)
   stop                                  unbind the agent; `rthas attach` restarts it
@@ -1716,6 +1811,91 @@ fn cmd_echo<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
     let rest: Vec<&str> = args.pos.iter().copied().skip(1).collect();
     writeln!(out, "{}", rest.join(" "))
 }
+
+fn cmd_kill<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
+    let raw = args.pos.get(1).copied().unwrap_or("");
+    match raw.parse::<u32>() {
+        Ok(id) if crate::jobs::kill(id) => writeln!(out, "killed job {id}"),
+        Ok(id) => writeln!(out, "no job {id}"),
+        Err(_) => writeln!(out, "usage: kill <job-id>"),
+    }
+}
+
+fn cmd_history<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
+    let a = args.pos.get(1).copied().unwrap_or("");
+    if a == "-c" || args.flag("c") {
+        crate::history::clear();
+        writeln!(out, "history cleared")?;
+        return Ok(());
+    }
+    let n = a.parse::<usize>().unwrap_or(0);
+    write!(out, "{}", crate::history::render(n))
+}
+
+fn cmd_base64<W: Write>(args: &Args, out: &mut W) -> std::io::Result<()> {
+    let decode = args.flag("d") || args.flag("decode") || args.pos.iter().any(|t| *t == "-d");
+    let path = args
+        .get("input")
+        .or_else(|| args.get("in"))
+        .or_else(|| {
+            args.pos
+                .iter()
+                .copied()
+                .skip(1)
+                .find(|t| !t.starts_with('-'))
+        })
+        .unwrap_or("");
+    if path.is_empty() {
+        writeln!(out, "usage: base64 [-d] PATH")?;
+        return Ok(());
+    }
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) => {
+            writeln!(out, "base64 {path}: {e}")?;
+            return Ok(());
+        }
+    };
+    if !meta.is_file() || meta.len() > CAT_MAX {
+        writeln!(
+            out,
+            "base64 {path}: not a regular file or exceeds {} byte limit",
+            CAT_MAX
+        )?;
+        return Ok(());
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            writeln!(out, "base64 {path}: {e}")?;
+            return Ok(());
+        }
+    };
+    if decode {
+        let text = String::from_utf8_lossy(&bytes);
+        match crate::base64::decode(&text) {
+            Ok(raw) => match String::from_utf8(raw) {
+                Ok(s) => write!(out, "{s}"),
+                Err(e) => out.write_all(&e.into_bytes()),
+            },
+            Err(e) => writeln!(out, "base64 -d: {e}"),
+        }
+    } else {
+        writeln!(out, "{}", crate::base64::encode(&bytes))
+    }
+}
+
+const KEYMAP: &str = "\
+rthas keys (CLI / nc)
+  ctrl-c     stop a streaming command or leave `rthas shell`
+  quit       close this session (agent keeps running)
+  stop       unbind the agent
+
+jobs
+  <cmd> &              run in the background (log under /tmp)
+  <cmd> > FILE [&]     redirect output
+  jobs / kill N        list / stop
+";
 
 fn cmd_session<W: Write>(out: &mut W, authed: bool) -> std::io::Result<()> {
     let probes = registry();

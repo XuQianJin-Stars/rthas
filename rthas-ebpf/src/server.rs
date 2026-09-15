@@ -37,6 +37,7 @@ mod linux {
     use crate::event::{KIND_ENTER, KIND_EXIT};
     use crate::format::format_dur;
     use crate::glob::glob_match;
+    use crate::proc;
     use crate::stats::{self, Sample};
     use crate::symbols::{self, Symbol};
     use crate::tree::Forest;
@@ -102,7 +103,7 @@ mod linux {
         match verb {
             "help" | "?" => out.write_all(HELP.as_bytes())?,
             "ping" => writeln!(out, "pong pid={pid} probes={} backend=ebpf", symbols.len())?,
-            "list" => cmd_list(&args, symbols, out)?,
+            "list" | "sm" => cmd_list(&args, symbols, out)?,
             "on" => {
                 let n = set_enabled(symbols, args.pattern(), true);
                 writeln!(out, "enabled {n} symbol(s) matching '{}'", args.pattern())?;
@@ -123,6 +124,12 @@ mod linux {
             "stats" => cmd_stats(&args, symbols, biases, bpf, out)?,
             "top" => cmd_top(&args, symbols, biases, bpf, out)?,
             "monitor" => cmd_monitor(&args, symbols, biases, bpf, out)?,
+            "pwd" => cmd_pwd(pid, out)?,
+            "sysenv" => cmd_sysenv(pid, &args, out)?,
+            "memory" => cmd_memory(pid, out)?,
+            "session" => cmd_session(pid, symbols.len(), out)?,
+            "version" => writeln!(out, "rthas-ebpf {}", env!("CARGO_PKG_VERSION"))?,
+            "jvm" | "runtime" => cmd_jvm(pid, out)?,
             "stop" => {
                 bpf.detach();
                 stop.store(true, Ordering::SeqCst);
@@ -133,8 +140,8 @@ mod linux {
                 writeln!(out, "bye")?;
                 return Ok(false);
             }
-            "stack" | "tt" | "dashboard" | "thread" | "memory" | "sysenv" | "jvm" | "runtime"
-            | "sysprop" | "session" | "options" | "reset" | "clear" | "version" | "profiler" => {
+            "stack" | "tt" | "dashboard" | "thread" | "sysprop" | "options" | "reset" | "clear"
+            | "profiler" => {
                 writeln!(out, "{verb} is not available on eBPF attach")?;
             }
             other => writeln!(out, "unknown command '{other}'. try 'help'")?,
@@ -463,5 +470,65 @@ mod linux {
             }
         }
         out
+    }
+
+    fn cmd_pwd<W: Write>(pid: u32, out: &mut W) -> std::io::Result<()> {
+        match std::fs::read_link(format!("/proc/{pid}/cwd")) {
+            Ok(p) => writeln!(out, "{}", p.display()),
+            Err(e) => writeln!(out, "pwd: {e}"),
+        }
+    }
+
+    fn cmd_sysenv<W: Write>(pid: u32, args: &Args, out: &mut W) -> std::io::Result<()> {
+        match std::fs::read(format!("/proc/{pid}/environ")) {
+            Ok(bytes) => {
+                let rows = proc::parse_environ(&bytes);
+                write!(out, "{}", proc::render_sysenv(&rows, args.pattern()))
+            }
+            Err(e) => writeln!(out, "sysenv: {e}"),
+        }
+    }
+
+    fn cmd_memory<W: Write>(pid: u32, out: &mut W) -> std::io::Result<()> {
+        match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            Ok(status) => write!(
+                out,
+                "{}",
+                proc::render_memory(&proc::parse_status_memory(&status))
+            ),
+            Err(e) => writeln!(out, "memory: {e}"),
+        }
+    }
+
+    fn cmd_session<W: Write>(pid: u32, symbols: usize, out: &mut W) -> std::io::Result<()> {
+        let dir = std::env::var("RTHAS_SOCK_DIR").unwrap_or_else(|_| "/tmp".into());
+        writeln!(out, " {:<12} {}", "Name", "Value")?;
+        writeln!(out, "{}", "-".repeat(50))?;
+        writeln!(out, " {:<12} {pid}", "PID")?;
+        writeln!(out, " {:<12} {dir}/rthas-{pid}.sock", "SOCKET")?;
+        writeln!(out, " {:<12} {symbols}", "SYMBOLS")?;
+        writeln!(out, " {:<12} ebpf", "BACKEND")?;
+        Ok(())
+    }
+
+    fn cmd_jvm<W: Write>(pid: u32, out: &mut W) -> std::io::Result<()> {
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "-".into());
+        let cwd = std::fs::read_link(format!("/proc/{pid}/cwd"))
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "-".into());
+        let args = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|b| proc::parse_cmdline(&b))
+            .unwrap_or_else(|_| "-".into());
+        writeln!(out, "RUNTIME")?;
+        writeln!(out, "{}", "-".repeat(94))?;
+        writeln!(out, " {:<28} {pid}", "PID")?;
+        writeln!(out, " {:<28} {exe}", "EXE")?;
+        writeln!(out, " {:<28} {cwd}", "CWD")?;
+        writeln!(out, " {:<28} {args}", "INPUT-ARGUMENTS")?;
+        writeln!(out, " {:<28} linux", "OS")?;
+        writeln!(out, " {:<28} ebpf-uprobe", "VM-NAME")?;
+        Ok(())
     }
 }

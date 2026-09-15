@@ -58,7 +58,10 @@
 //! ```
 
 mod agent;
+mod base64;
 mod event;
+mod history;
+mod jobs;
 mod pipe;
 mod probe;
 mod profiler;

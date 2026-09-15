@@ -66,7 +66,7 @@ impl<'a> Args<'a> {
 
 pub const HELP: &str = "\
 rthas eBPF attach (uninstrumented process)
-  list [pattern]                 enumerate symbols in the target binary
+  list [pattern] / sm [pattern]  enumerate symbols in the target binary
   on <pattern> / off [pattern]   mark symbols enabled (off by default)
   trace <pattern> [opts]         call trees from uprobe enter/exit
      --count N / --seconds F / --depth N / --min-ms F
@@ -78,10 +78,13 @@ rthas eBPF attach (uninstrumented process)
   monitor <pattern> [opts]       periodic totals (ERR/fail-rate always 0)
      --interval F / --count N / --seconds F
   stop                           detach and exit this helper
+  pwd / sysenv / memory / session / version / jvm
+                                 target process snapshot via /proc
+  <cmd> | grep|tee|wc            in-process pipes (same flags as the library)
   ping / help
 
 No Debug args/return values. Async call trees are not reliable.
-stack/tt/dashboard/memory/jvm/sysprop/profiler are not available on eBPF attach.
+stack/tt/dashboard/thread/profiler/sysprop are not available on eBPF attach.
 ";
 
 pub fn handle_client<F>(stream: UnixStream, mut dispatch: F) -> std::io::Result<()>
@@ -100,7 +103,22 @@ where
         if cmd.is_empty() {
             continue;
         }
-        let keep_open = dispatch(cmd, &mut writer)?;
+        let (cmd, pipes) = crate::pipe::split_pipeline(cmd);
+        let keep_open = if pipes.is_empty() {
+            dispatch(&cmd, &mut writer)?
+        } else {
+            match crate::pipe::Pipeline::new(&mut writer, &pipes) {
+                Ok(mut pipe) => {
+                    let keep = dispatch(&cmd, &mut pipe)?;
+                    pipe.finish()?;
+                    keep
+                }
+                Err(e) => {
+                    writeln!(writer, "{e}")?;
+                    true
+                }
+            }
+        };
         writeln!(writer, "{}", crate::END)?;
         writer.flush()?;
         if !keep_open {
@@ -137,6 +155,8 @@ mod tests {
         assert!(HELP.contains("stats <pattern>"));
         assert!(HELP.contains("top <pattern>"));
         assert!(HELP.contains("monitor <pattern>"));
+        assert!(HELP.contains("pwd / sysenv"));
+        assert!(HELP.contains("<cmd> | grep"));
         assert!(!HELP.contains("stack/tt/monitor/stats"));
     }
 }

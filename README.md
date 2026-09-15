@@ -25,10 +25,15 @@ Java gets [Arthas](https://github.com/alibaba/arthas) because the JVM can rewrit
 | `sysenv` / `memory` / `session` / `options` / `version` / `stop` | JMX / agent | process env, OS memory, runtime knobs | ✅ | ✅ implemented |
 | `jvm` / `sysprop` | JMX | rustc/os/features snapshot; read-only knobs | ✅ | ✅ implemented (`runtime` aliases `jvm`) |
 | `auth` + pipes (`grep` / `tee` / `wc`) / `pwd` / `cat` | telnet session | `RTHAS_PASSWORD` per connection; in-process pipes | ✅ | ✅ implemented |
+| `jobs` / `&` / `kill` / `>` | async jobs | background command + log file | ✅ | ✅ implemented (no fg/bg/ctrl-z) |
+| `history` / `cls` / `base64` / batch `-f` | telnet / as.sh | in-process history; CLI `-f` / `-c` | ✅ | ✅ implemented |
 | Restart-free attach to an **instrumented** process | Attach API | trigger file wakes a deferred agent | ✅ | ✅ implemented |
 | `profiler` flame graph | async-profiler | SIGPROF (cpu) / ITIMER_REAL (wall) | ✅ | ✅ start / stop / status (`--event cpu\|wall`) |
-| Restart-free attach to an **un-instrumented** process | Attach API | eBPF uprobe only (Linux + root + symbols) | ⚠️ | ✅ `attach --ebpf` (name + latency; `trace`/`watch`/`stats`/`top`/`monitor`; no Debug args) |
-| `jad` decompile / `redefine` hot swap | runtime class redefinition | impossible (machine code is not rewritable) | ❌ | — |
+| Restart-free attach to an **un-instrumented** process | Attach API | eBPF uprobe only (Linux + root + symbols) | ⚠️ | ✅ `attach --ebpf` (`trace`/`watch`/`stats`/`top`/`monitor` + `/proc` sysenv/memory/jvm; no Debug args) |
+| `jad` / `redefine` / `retransform` / `dump` / `mc` / `classloader` | runtime class redefinition | impossible (machine code is not rewritable) | ❌ | — |
+| `ognl` / `getstatic` / `heapdump` / `mbean` / `jfr` / `vmtool` | JVM object model | no VM heap or bytecode | ❌ | — |
+| `logger` / `perfcounter` / web-console / HTTP API | JVM / Spring / telnet UI | no JVM logger, JMX beans, or HTTP server | ❌ | — |
+| `profiler --event alloc/lock` / `tt -p` replay | async-profiler / OGNL | no JVM alloc sampler; tt stores Debug strings | ❌ | — |
 
 `attach` splits in two, and each half takes its own route:
 
@@ -133,6 +138,8 @@ cargo run --bin rthas -- sysprop rustc
 cargo run --bin rthas -- shell
 #   rthas> list | grep handle
 #   rthas> sysenv | grep -i path | wc
+#   rthas> monitor handle --interval 1 --count 0 > /tmp/mon.log &
+#   rthas> jobs
 ```
 
 ## Commands
@@ -161,7 +168,13 @@ cargo run --bin rthas -- shell
 | `sysprop [NAME]` | Read-only knobs (`os`, `rustc`, `rthas`); no `System.setProperty` |
 | `sysenv [NAME]` | Process environment (read-only) |
 | `session` | pid, socket, probes, ring, tunnel, profiler, auth |
-| `options [name] [value]` | List or set runtime knobs (`max-str`, `tz-hours`) |
+| `options` / `vmoption` `[name] [value]` | List or set runtime knobs (`max-str`, `tz-hours`) |
+| `sm [pattern]` | Alias of `list` (Arthas search-method) |
+| `jobs` / `kill N` | Background jobs; `<cmd> > FILE &` |
+| `history [N]` / `history -c` | Command history |
+| `cls` / `keymap` | Clear screen / supported keys |
+| `base64 [-d] PATH` | Encode / decode a file (2 MiB cap) |
+| `-f FILE` / `-c COMMAND` | Batch script (CLI) |
 | `auth [password]` | Authenticate this connection when `RTHAS_PASSWORD` is set |
 | `pwd` / `cat PATH` / `echo ...` | Process working directory and files (cat capped at 2 MiB) |
 | `<cmd> \| grep PATTERN` | Pipe: `-i -v -n -c -m N -A N -B N -C N` (substring; no regex) |
@@ -333,6 +346,9 @@ A disabled probe has **zero allocation** and is always branch-predicted taken. A
 │  │  event.rs     — bounded FIFO (16K)      │ │
 │  │  tunnel.rs    — indexed tt fragments    │ │
 │  │  pipe.rs      — grep / tee / wc pipes   │ │
+│  │  jobs.rs      — background `&` / kill   │ │
+│  │  history.rs   — command history         │ │
+│  │  base64.rs    — encode / decode a file  │ │
 │  │  tree.rs      — forest → render         │ │
 │  │  probe.rs     — static sites + registry │ │
 │  │  span.rs      — thread-local stack      │ │

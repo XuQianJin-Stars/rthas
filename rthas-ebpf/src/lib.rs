@@ -23,6 +23,8 @@ pub mod args;
 pub mod event;
 pub mod format;
 pub mod glob;
+pub mod pipe;
+pub mod proc;
 pub mod server;
 pub mod stats;
 pub mod symbols;

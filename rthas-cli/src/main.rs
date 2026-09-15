@@ -58,6 +58,8 @@ DISCOVERY:
     attach --ebpf <pid>             eBPF uprobes (Linux + root + unstripped;
                                     trace/watch/stats/top/monitor, no Debug args)
     shell                           interactive session
+    -f FILE / --file FILE           run a batch script (one command per line)
+    -c COMMAND                      run one command string
 
 ATTACHING
     A process that calls rthas::init() at startup is reachable straight away.
@@ -108,6 +110,10 @@ PROCESS:
     version                         rthas library version in this process
     stop                            unbind the agent; attach restarts it
     pwd / cat PATH / echo TEXT      process cwd and files
+    base64 [-d] PATH                encode / decode a file
+    history [N] / history -c        command history
+    jobs / kill N                   background jobs (`cmd > FILE &`)
+    cls / keymap                    clear screen / keys
     auth [password]                 authenticate if RTHAS_PASSWORD is set
     <cmd> | grep|tee|wc             in-process pipes (also: rthas list \\| grep foo)
 
@@ -133,6 +139,7 @@ EXAMPLES:
     rthas sysprop rustc
     rthas list \\| grep handle
     rthas --password secret session
+    rthas -c 'jvm' --pid 1234
 ";
 
 /// Accept `rthas --pid 5 list` as a synonym of `rthas list --pid 5`.
@@ -186,10 +193,34 @@ fn main() {
             }
         },
         "shell" => cmd_shell(&argv[1..]),
-        cmd @ ("list" | "trace" | "watch" | "stack" | "dashboard" | "thread" | "profiler" | "stats" | "top"
-        | "on" | "off" | "clear" | "ping" | "monitor" | "tt" | "sysenv" | "jvm" | "runtime"
-        | "sysprop" | "memory" | "version"
-        | "session" | "options" | "stop" | "reset" | "auth" | "pwd" | "cat" | "echo") => {
+        "-f" | "--file" => {
+            let path = argv.get(1).map(String::as_str).unwrap_or("");
+            if path.is_empty() {
+                eprintln!("rthas: -f needs a script path");
+                std::process::exit(2);
+            }
+            if let Err(e) = cmd_script_file(path, &argv[2..]) {
+                eprintln!("rthas: {e}");
+                std::process::exit(1);
+            }
+        }
+        "-c" => {
+            let line = argv.get(1).map(String::as_str).unwrap_or("");
+            if line.is_empty() {
+                eprintln!("rthas: -c needs a command string");
+                std::process::exit(2);
+            }
+            if let Err(e) = cmd_script_lines(&[line.to_string()], &argv[2..]) {
+                eprintln!("rthas: {e}");
+                std::process::exit(1);
+            }
+        }
+        cmd @ ("list" | "sm" | "trace" | "watch" | "stack" | "dashboard" | "thread"
+        | "profiler" | "stats" | "top" | "on" | "off" | "clear" | "ping" | "monitor"
+        | "tt" | "sysenv" | "jvm" | "runtime" | "sysprop" | "memory" | "version"
+        | "session" | "options" | "vmoption" | "stop" | "reset" | "auth" | "pwd" | "cat"
+        | "echo" | "jobs" | "kill" | "history" | "cls" | "keymap" | "base64" | "fg"
+        | "bg") => {
             if let Err(e) = cmd_remote(cmd, &argv[1..]) {
                 eprintln!("rthas: {e}");
                 std::process::exit(1);
@@ -230,7 +261,9 @@ fn parse_target(args: &[String]) -> (Target, Vec<String>) {
             "--sock-dir" => target.sock_dir = it.next().map(PathBuf::from),
             "--pid" => target.pid = it.next().and_then(|v| v.parse().ok()),
             "--password" => target.password = it.next().cloned(),
-            _ if arg.starts_with("--sock=") => target.sock = arg.split_once('=').map(|(_, v)| v.into()),
+            _ if arg.starts_with("--sock=") => {
+                target.sock = arg.split_once('=').map(|(_, v)| v.into())
+            }
             _ if arg.starts_with("--pid=") => {
                 target.pid = arg.split_once('=').and_then(|(_, v)| v.parse().ok())
             }
@@ -577,7 +610,10 @@ fn cmd_attach_instrumented(pid: u32, sock_dir: Option<PathBuf>) -> Result<(), St
                 ));
             }
             Some(true) => {}
-            None => eprintln!("rthas: could not read {} to check for probes", binary.display()),
+            None => eprintln!(
+                "rthas: could not read {} to check for probes",
+                binary.display()
+            ),
         }
     }
 
@@ -608,9 +644,7 @@ fn cmd_attach_ebpf(pid: u32, sock_dir: Option<PathBuf>) -> Result<(), String> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (pid, sock_dir);
-        Err(
-            "eBPF attach requires Linux (kernel 5.5+, CAP_BPF/root, unstripped binary)".into(),
-        )
+        Err("eBPF attach requires Linux (kernel 5.5+, CAP_BPF/root, unstripped binary)".into())
     }
     #[cfg(target_os = "linux")]
     {
@@ -699,14 +733,11 @@ fn default_sock_dir() -> PathBuf {
 }
 
 fn password_for(target: &Target) -> Option<String> {
-    target
-        .password
-        .clone()
-        .or_else(|| {
-            std::env::var("RTHAS_PASSWORD")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
+    target.password.clone().or_else(|| {
+        std::env::var("RTHAS_PASSWORD")
+            .ok()
+            .filter(|s| !s.is_empty())
+    })
 }
 
 fn maybe_auth(stream: &mut UnixStream, target: &Target) -> Result<(), String> {
@@ -758,8 +789,8 @@ fn cmd_remote(cmd: &str, args: &[String]) -> Result<(), String> {
         ));
     }
 
-    let mut stream = UnixStream::connect(&sock)
-        .map_err(|e| format!("connect {}: {e}", sock.display()))?;
+    let mut stream =
+        UnixStream::connect(&sock).map_err(|e| format!("connect {}: {e}", sock.display()))?;
 
     maybe_auth(&mut stream, &target)?;
 
@@ -777,6 +808,44 @@ fn cmd_remote(cmd: &str, args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("send: {e}"))?;
 
     stream_to_stdout(&mut stream)
+}
+
+fn cmd_script_file(path: &str, args: &[String]) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let lines: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|s| s.to_string())
+        .collect();
+    cmd_script_lines(&lines, args)
+}
+
+fn cmd_script_lines(lines: &[String], args: &[String]) -> Result<(), String> {
+    let (target, _) = parse_target(args);
+    let sock = resolve_sock(&target)?;
+    if !sock.exists() {
+        return Err(format!(
+            "no agent at {}. Is the process still running?",
+            sock.display()
+        ));
+    }
+    let mut stream =
+        UnixStream::connect(&sock).map_err(|e| format!("connect {}: {e}", sock.display()))?;
+    maybe_auth(&mut stream, &target)?;
+    for line in lines {
+        println!("# {line}");
+        stream
+            .write_all(line.as_bytes())
+            .and_then(|_| stream.write_all(b"\n"))
+            .and_then(|_| stream.flush())
+            .map_err(|e| format!("send: {e}"))?;
+        stream_to_stdout(&mut stream)?;
+        if matches!(line.as_str(), "quit" | "exit" | "q" | "stop") {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Copy the agent's reply to stdout, stopping at the end sentinel.
@@ -822,7 +891,10 @@ fn cmd_shell(args: &[String]) {
         eprintln!("rthas: {e}");
         std::process::exit(1);
     }
-    eprintln!("connected to {} (type 'help', 'quit' to leave)", sock.display());
+    eprintln!(
+        "connected to {} (type 'help', 'quit' to leave)",
+        sock.display()
+    );
 
     let stdin = std::io::stdin();
     let mut input = String::new();
@@ -842,7 +914,8 @@ fn cmd_shell(args: &[String]) {
         if cmd.is_empty() {
             continue;
         }
-        if let Err(e) = stream.write_all(cmd.as_bytes())
+        if let Err(e) = stream
+            .write_all(cmd.as_bytes())
             .and_then(|_| stream.write_all(b"\n"))
             .and_then(|_| stream.flush())
         {
@@ -897,7 +970,10 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert_eq!(attach_args(&args).unwrap().pid, 4711);
-        assert_eq!(attach_args(&args).unwrap().sock_dir, Some(PathBuf::from("/tmp/x")));
+        assert_eq!(
+            attach_args(&args).unwrap().sock_dir,
+            Some(PathBuf::from("/tmp/x"))
+        );
         assert!(!attach_args(&args).unwrap().ebpf);
 
         let ebpf = attach_args(&["--ebpf".into(), "9".into()]).unwrap();
@@ -909,7 +985,10 @@ mod tests {
 
     #[test]
     fn rotates_leading_target_flags_only() {
-        let argv: Vec<String> = ["--pid", "5", "list"].iter().map(|s| s.to_string()).collect();
+        let argv: Vec<String> = ["--pid", "5", "list"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert_eq!(rotate_target_flags(argv), vec!["list", "--pid", "5"]);
 
         let argv: Vec<String> = ["--pid=5", "list"].iter().map(|s| s.to_string()).collect();
