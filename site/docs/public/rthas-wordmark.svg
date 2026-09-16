@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 168" role="img" aria-label="rthas">
+  <defs>
+    <linearGradient id="rthas-grad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#3ec8ff"/>
+      <stop offset="0.35" stop-color="#6b6bff"/>
+      <stop offset="0.7" stop-color="#c43cff"/>
+      <stop offset="1" stop-color="#ff5a7a"/>
+    </linearGradient>
+  </defs>
+  <text
+    x="8"
+    y="124"
+    fill="url(#rthas-grad)"
+    font-family="Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif"
+    font-size="112"
+    font-weight="800"
+    letter-spacing="-5"
+  >rthas</text>
+  <rect x="12" y="144" width="320" height="8" rx="4" fill="url(#rthas-grad)"/>
+</svg>

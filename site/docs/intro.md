@@ -1,6 +1,6 @@
 # Introduction
 
-<p class="intro-brand">rthas</p>
+![rthas](/rthas-wordmark.svg)
 
 rthas is an Arthas-flavoured runtime probe toolkit for Rust. It helps you troubleshoot a **running** Rust process — call trees, arguments, latency, threads, flame graphs — without a debugger and without restarting the server.
 
