@@ -34,12 +34,34 @@ jobs:
 
       # Nightly first, then stable, so `cargo` stays on stable while
       # rthas-ebpf/build.rs can still invoke `cargo +nightly`.
+      #
+      # Do not `rustup target add bpfel-unknown-none`: that target has no
+      # prebuilt std, so rustup fails with DistError on most nightlies.
+      # rust-src + `-Z build-std=core` (already in build.rs) is enough.
+      # Latest nightly sometimes ships without rust-src; walk back a few days
+      # and `toolchain link` so `cargo +nightly` still resolves.
       - name: Install nightly (eBPF program)
         if: runner.os == 'Linux'
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src
-          targets: bpfel-unknown-none
+        run: |
+          set -euo pipefail
+          try_install() {
+            rustup toolchain install "$1" --profile minimal --component rust-src
+          }
+          if try_install nightly; then
+            rustc +nightly -vV
+            exit 0
+          fi
+          echo "::warning::latest nightly is missing rust-src; walking back dates"
+          for i in $(seq 1 14); do
+            spec="nightly-$(date -u -d "$i days ago" +%F)"
+            if try_install "$spec"; then
+              rustup toolchain link nightly "$(rustc "+$spec" --print sysroot)"
+              rustc +nightly -vV
+              exit 0
+            fi
+          done
+          echo "::error::no nightly with rust-src in the last 14 days"
+          exit 1
 
       - name: Install stable
         uses: dtolnay/rust-toolchain@stable
