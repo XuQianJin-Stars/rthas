@@ -1,0 +1,16 @@
+.intro-brand {
+  font-size: 3.4rem;
+  font-weight: 800;
+  letter-spacing: -0.04em;
+  line-height: 1.1;
+  margin: 0.4rem 0 1.4rem;
+  background: linear-gradient(90deg, #41d1ff 0%, #7373ff 40%, #bd34fe 75%, #ff6b6b 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.vp-doc table {
+  display: table;
+  width: 100%;
+}

@@ -3,6 +3,8 @@
 > **Arthas-flavoured runtime probe toolkit for Rust**  
 > `trace` / `watch` / `stack` / `stats` / `top` / `dashboard` / `thread` / `profiler` / `attach --ebpf` — without a debugger.
 
+**Docs:** https://xuqianjin-stars.github.io/rthas
+
 Java gets [Arthas](https://github.com/alibaba/arthas) because the JVM can rewrite bytecode at runtime (Instrumentation), attach to a live process (Attach API), and redefine classes on the fly (JVMTI). Rust is ahead-of-time compiled to machine code with no VM layer, so those tricks are simply unavailable.
 
 `rthas` takes the part that **is achievable** in Rust and makes it pleasant:

@@ -4,3 +4,8 @@
 
 # Control sockets created by running processes.
 /tmp/
+
+# Docs site (VitePress)
+node_modules
+site/docs/.vitepress/cache
+site/docs/.vitepress/dist
