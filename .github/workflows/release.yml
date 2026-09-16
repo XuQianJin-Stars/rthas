@@ -1,4 +1,7 @@
 # One-file rthas CLI for GitHub Releases (Linux embeds rthas-ebpf).
+#
+# Two waves of two: Linux first, then Darwin. Intel macOS is cross-compiled
+# on macos-latest (Apple Silicon) — macos-13 runners queue for a long time.
 name: Release
 
 on:
@@ -14,30 +17,22 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  build:
+  linux:
     name: ${{ matrix.artifact }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         include:
           - os: ubuntu-latest
             artifact: rthas-linux-amd64
-            embed: true
           - os: ubuntu-24.04-arm
             artifact: rthas-linux-arm64
-            embed: true
-          - os: macos-latest
-            artifact: rthas-darwin-arm64
-            embed: false
-          - os: macos-13
-            artifact: rthas-darwin-amd64
-            embed: false
     steps:
       - uses: actions/checkout@v4
 
       - name: Install nightly (eBPF program)
-        if: matrix.embed
         run: bash scripts/ci-bpf-toolchain.sh
 
       - uses: dtolnay/rust-toolchain@stable
@@ -47,17 +42,14 @@ jobs:
           shared-key: release-${{ matrix.artifact }}
 
       - name: Install bpf-linker
-        if: matrix.embed
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-binstall
 
       - name: cargo binstall bpf-linker
-        if: matrix.embed
         run: cargo binstall --no-confirm --force bpf-linker
 
       - name: Build helper and embed into CLI
-        if: matrix.embed
         run: |
           set -euo pipefail
           cargo build -p rthas-ebpf --release --locked
@@ -67,13 +59,41 @@ jobs:
           strip target/release/rthas || true
           cp target/release/rthas "${{ matrix.artifact }}"
 
-      - name: Build CLI only
-        if: ${{ !matrix.embed }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  darwin:
+    name: ${{ matrix.artifact }}
+    needs: linux
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - artifact: rthas-darwin-arm64
+            target: aarch64-apple-darwin
+          - artifact: rthas-darwin-amd64
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.artifact }}
+
+      - name: Build CLI
         run: |
           set -euo pipefail
-          cargo build -p rthas-cli --release --locked
-          strip target/release/rthas || true
-          cp target/release/rthas "${{ matrix.artifact }}"
+          cargo build -p rthas-cli --release --locked --target "${{ matrix.target }}"
+          strip "target/${{ matrix.target }}/release/rthas" || true
+          cp "target/${{ matrix.target }}/release/rthas" "${{ matrix.artifact }}"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -81,9 +101,9 @@ jobs:
           path: ${{ matrix.artifact }}
 
   publish:
-    needs: build
+    needs: [linux, darwin]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
