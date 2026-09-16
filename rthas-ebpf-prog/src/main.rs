@@ -15,10 +15,11 @@
 #![no_std]
 #![no_main]
 
+use aya_ebpf::helpers::gen::bpf_get_func_ip;
 use aya_ebpf::helpers::{bpf_get_current_pid_tgid, bpf_ktime_get_ns};
 use aya_ebpf::macros::{map, uprobe, uretprobe};
 use aya_ebpf::maps::RingBuf;
-use aya_ebpf::programs::ProbeContext;
+use aya_ebpf::programs::{ProbeContext, RetProbeContext};
 use aya_ebpf::EbpfContext;
 
 /// Must stay in lockstep with `rthas_ebpf::event::RawEvent`.
@@ -44,17 +45,18 @@ pub fn rthas_enter(ctx: ProbeContext) -> u32 {
 }
 
 #[uretprobe]
-pub fn rthas_exit(ctx: ProbeContext) -> u32 {
+pub fn rthas_exit(ctx: RetProbeContext) -> u32 {
     submit(&ctx, KIND_EXIT)
 }
 
-fn submit(ctx: &ProbeContext, kind: u8) -> u32 {
+fn submit(ctx: &impl EbpfContext, kind: u8) -> u32 {
     let Some(mut slot) = EVENTS.reserve::<RawEvent>(0) else {
         return 0;
     };
     let ev = RawEvent {
         ts_ns: bpf_ktime_get_ns(),
-        ip: ctx.ip() as u64,
+        // SAFETY: `ctx` is the probe context the kernel passed to this program.
+        ip: unsafe { bpf_get_func_ip(ctx.as_ptr()) },
         tid: bpf_get_current_pid_tgid() as u32,
         kind,
         _pad: [0; 3],
