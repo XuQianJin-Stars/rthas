@@ -40,6 +40,9 @@ pub struct Agg {
     pub durs: Vec<u64>,
 }
 
+/// Cap collected samples so a long `--seconds` window cannot grow without bound.
+pub const SAMPLE_CAP: usize = 16_384;
+
 /// How long `stats` / `top` collect. Neither flag → default window.
 pub fn collect_limit(seconds: f64, count: usize) -> (Option<f64>, usize) {
     if seconds > 0.0 {

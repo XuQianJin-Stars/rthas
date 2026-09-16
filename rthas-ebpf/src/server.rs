@@ -163,7 +163,7 @@ mod linux {
         n
     }
 
-    fn cmd_list<W: Write>(args: &Args, symbols: &[Symbol], out: &mut W) -> std::io::Result<()> {
+    fn cmd_list<W: Write + ?Sized>(args: &Args, symbols: &[Symbol], out: &mut W) -> std::io::Result<()> {
         let pattern = args.pattern();
         let hits: Vec<(usize, &Symbol)> = symbols
             .iter()
@@ -189,7 +189,7 @@ mod linux {
         Ok(())
     }
 
-    fn cmd_stream<W: Write>(
+    fn cmd_stream<W: Write + ?Sized>(
         args: &Args,
         symbols: &[Symbol],
         biases: &[(PathBuf, u64)],
@@ -295,7 +295,7 @@ mod linux {
         Ok(())
     }
 
-    fn cmd_stats<W: Write>(
+    fn cmd_stats<W: Write + ?Sized>(
         args: &Args,
         symbols: &[Symbol],
         biases: &[(PathBuf, u64)],
@@ -318,7 +318,7 @@ mod linux {
         Ok(())
     }
 
-    fn cmd_top<W: Write>(
+    fn cmd_top<W: Write + ?Sized>(
         args: &Args,
         symbols: &[Symbol],
         biases: &[(PathBuf, u64)],
@@ -343,7 +343,7 @@ mod linux {
         Ok(())
     }
 
-    fn cmd_monitor<W: Write>(
+    fn cmd_monitor<W: Write + ?Sized>(
         args: &Args,
         symbols: &[Symbol],
         biases: &[(PathBuf, u64)],
@@ -473,7 +473,7 @@ mod linux {
         out
     }
 
-    fn cmd_dashboard<W: Write>(
+    fn cmd_dashboard<W: Write + ?Sized>(
         pid: u32,
         args: &Args,
         symbols: &[Symbol],
@@ -575,7 +575,7 @@ mod linux {
         Ok(())
     }
 
-    fn cmd_thread<W: Write>(pid: u32, args: &Args, out: &mut W) -> std::io::Result<()> {
+    fn cmd_thread<W: Write + ?Sized>(pid: u32, args: &Args, out: &mut W) -> std::io::Result<()> {
         let tid_arg = args.pos.get(1).and_then(|s| s.parse::<u64>().ok());
         let limit = args.num("n", 0usize);
         let by = args.get("by").unwrap_or(if limit > 0 || tid_arg.is_some() {
@@ -678,14 +678,14 @@ mod linux {
         100
     }
 
-    fn cmd_pwd<W: Write>(pid: u32, out: &mut W) -> std::io::Result<()> {
+    fn cmd_pwd<W: Write + ?Sized>(pid: u32, out: &mut W) -> std::io::Result<()> {
         match std::fs::read_link(format!("/proc/{pid}/cwd")) {
             Ok(p) => writeln!(out, "{}", p.display()),
             Err(e) => writeln!(out, "pwd: {e}"),
         }
     }
 
-    fn cmd_sysenv<W: Write>(pid: u32, args: &Args, out: &mut W) -> std::io::Result<()> {
+    fn cmd_sysenv<W: Write + ?Sized>(pid: u32, args: &Args, out: &mut W) -> std::io::Result<()> {
         match std::fs::read(format!("/proc/{pid}/environ")) {
             Ok(bytes) => {
                 let rows = proc::parse_environ(&bytes);
@@ -695,7 +695,7 @@ mod linux {
         }
     }
 
-    fn cmd_memory<W: Write>(pid: u32, out: &mut W) -> std::io::Result<()> {
+    fn cmd_memory<W: Write + ?Sized>(pid: u32, out: &mut W) -> std::io::Result<()> {
         match std::fs::read_to_string(format!("/proc/{pid}/status")) {
             Ok(status) => write!(
                 out,
@@ -706,7 +706,7 @@ mod linux {
         }
     }
 
-    fn cmd_session<W: Write>(pid: u32, symbols: usize, out: &mut W) -> std::io::Result<()> {
+    fn cmd_session<W: Write + ?Sized>(pid: u32, symbols: usize, out: &mut W) -> std::io::Result<()> {
         let dir = std::env::var("RTHAS_SOCK_DIR").unwrap_or_else(|_| "/tmp".into());
         writeln!(out, " {:<12} {}", "Name", "Value")?;
         writeln!(out, "{}", "-".repeat(50))?;
@@ -717,7 +717,7 @@ mod linux {
         Ok(())
     }
 
-    fn cmd_jvm<W: Write>(pid: u32, out: &mut W) -> std::io::Result<()> {
+    fn cmd_jvm<W: Write + ?Sized>(pid: u32, out: &mut W) -> std::io::Result<()> {
         let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "-".into());
