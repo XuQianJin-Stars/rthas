@@ -5,6 +5,15 @@
 
 **Docs:** https://xuqianjin-stars.github.io/rthas
 
+## Install the CLI
+
+```bash
+curl -fsSL https://github.com/XuQianJin-Stars/rthas/releases/latest/download/install.sh | bash
+# Linux: one binary, eBPF helper embedded. macOS: CLI only.
+```
+
+See [Install](https://xuqianjin-stars.github.io/rthas/install) for GitHub Release assets and building from source.
+
 Java gets [Arthas](https://github.com/alibaba/arthas) because the JVM can rewrite bytecode at runtime (Instrumentation), attach to a live process (Attach API), and redefine classes on the fly (JVMTI). Rust is ahead-of-time compiled to machine code with no VM layer, so those tricks are simply unavailable.
 
 `rthas` takes the part that **is achievable** in Rust and makes it pleasant:
@@ -314,7 +323,10 @@ The function-uprobe path will keep these limits. Protocol probes (HTTP/gRPC)
 are the planned way to get fail-rate and stripped-binary visibility without
 reading Rust values — see [Roadmap](#roadmap).
 
-Toolchain for compiling `rthas-ebpf` on Linux:
+A GitHub Release Linux binary already contains the helper (see [Install](#install-the-cli));
+no nightly / bpf-linker on the machine that runs `attach --ebpf`.
+
+Toolchain for compiling `rthas-ebpf` from source on Linux:
 
 ```bash
 rustup toolchain install nightly

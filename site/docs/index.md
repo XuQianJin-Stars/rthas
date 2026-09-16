@@ -10,8 +10,8 @@ hero:
       text: Quick Start
       link: /quick-start
     - theme: alt
-      text: View on GitHub
-      link: https://github.com/XuQianJin-Stars/rthas
+      text: Install
+      link: /install
 features:
   - icon: 🖥
     title: Dashboard

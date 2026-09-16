@@ -3,7 +3,7 @@
 When the target was **not** built with `#[rthas::trace]`, the only attach path is eBPF uprobes. This is Linux-only.
 
 ```bash
-# Build the helper next to the CLI (Aya needs nightly + rust-src + bpf-linker)
+# Build the helper next to the CLI, or download a Release binary that embeds it.
 cargo build -p rthas-cli -p rthas-ebpf -p example-plain
 
 ./target/debug/example-plain
@@ -31,7 +31,9 @@ rthas stop --pid 1234
 
 The function-uprobe path will keep these limits. Protocol probes (HTTP/gRPC) are the planned way to get fail-rate and stripped-binary visibility without reading Rust values — see [Roadmap](/roadmap).
 
-## Toolchain
+A [GitHub Release](https://github.com/XuQianJin-Stars/rthas/releases) Linux binary already contains the helper — no nightly / bpf-linker on the machine that runs `rthas attach --ebpf`. See [Install](/install).
+
+## Toolchain (from source)
 
 ```bash
 rustup toolchain install nightly

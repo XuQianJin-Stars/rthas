@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Command line client for the rthas probe agent"
+description = "Command line client for the rthas probe agent (Linux releases embed eBPF attach)"
 
 [[bin]]
 name = "rthas"

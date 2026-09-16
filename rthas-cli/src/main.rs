@@ -14,10 +14,9 @@
 
 //! `rthas` command line client.
 //!
-//! Deliberately dependency-free: it is a thin front-end that forwards your
-//! command line to the agent verbatim and streams the reply back. Keeping it
-//! to `std` means it builds in seconds and can be `scp`'d to a machine that
-//! has nothing but the target binary on it.
+//! Zero crate dependencies: it forwards your command line to the agent over a
+//! Unix socket. Linux **release** builds can embed `rthas-ebpf` (`RTHAS_EMBED_EBPF`)
+//! so `attach --ebpf` is a single file, like `arthas-boot.jar`.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -56,7 +55,8 @@ DISCOVERY:
     attach <pid>                    start the agent inside a running process
                                     that deferred it (RTHAS_AGENT=lazy)
     attach --ebpf <pid>             eBPF uprobes (Linux + root + unstripped;
-                                    trace/watch/stats/top/monitor, no Debug args)
+                                    trace/watch/stats/top/monitor, no Debug args).
+                                    Release binaries embed the helper.
     shell                           interactive session
     -f FILE / --file FILE           run a batch script (one command per line)
     -c COMMAND                      run one command string
@@ -666,16 +666,58 @@ fn cmd_attach_ebpf(pid: u32, sock_dir: Option<PathBuf>) -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 fn ebpf_helper() -> Result<PathBuf, String> {
+    if let Ok(path) = std::env::var("RTHAS_EBPF_HELPER") {
+        let p = PathBuf::from(&path);
+        if p.is_file() {
+            return Ok(p);
+        }
+        return Err(format!("RTHAS_EBPF_HELPER is not a file: {path}"));
+    }
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let dir = exe.parent().ok_or("cannot resolve rthas directory")?;
-    let helper = dir.join("rthas-ebpf");
-    if helper.is_file() {
-        return Ok(helper);
+    let sibling = dir.join("rthas-ebpf");
+    if sibling.is_file() {
+        return Ok(sibling);
+    }
+    if let Some(p) = materialize_embedded_helper()? {
+        return Ok(p);
     }
     Err(format!(
-        "rthas-ebpf helper not found at {}.\nBuild it with: cargo build -p rthas-ebpf",
-        helper.display()
+        "rthas-ebpf helper not found at {}.\n\
+         Release builds embed it (curl the GitHub Release binary).\n\
+         From source: cargo build -p rthas-cli -p rthas-ebpf\n\
+         Or set RTHAS_EBPF_HELPER to the helper path.",
+        sibling.display()
     ))
+}
+
+#[cfg(all(target_os = "linux", embed_ebpf))]
+fn materialize_embedded_helper() -> Result<Option<PathBuf>, String> {
+    use std::hash::{Hash, Hasher};
+    use std::os::unix::fs::PermissionsExt;
+
+    const BYTES: &[u8] = include_bytes!(env!("RTHAS_EMBED_EBPF_PATH"));
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    BYTES.len().hash(&mut hasher);
+    BYTES.hash(&mut hasher);
+    let dest = std::env::temp_dir().join(format!("rthas-ebpf-{:016x}", hasher.finish()));
+    if dest.is_file() {
+        if let Ok(meta) = dest.metadata() {
+            if meta.len() == BYTES.len() as u64 {
+                return Ok(Some(dest));
+            }
+        }
+    }
+    let tmp = dest.with_extension("tmp");
+    std::fs::write(&tmp, BYTES).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
+    std::fs::rename(&tmp, &dest).map_err(|e| format!("rename {}: {e}", dest.display()))?;
+    Ok(Some(dest))
+}
+
+#[cfg(all(target_os = "linux", not(embed_ebpf)))]
+fn materialize_embedded_helper() -> Result<Option<PathBuf>, String> {
+    Ok(None)
 }
 
 #[cfg(target_os = "linux")]

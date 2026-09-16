@@ -14,6 +14,7 @@ export default defineConfig({
     siteTitle: "rthas",
     nav: [
       { text: "Home", link: "/" },
+      { text: "Install", link: "/install" },
       { text: "Docs", link: "/intro" },
       { text: "Commands", link: "/commands" },
       {

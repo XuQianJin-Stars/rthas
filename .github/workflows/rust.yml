@@ -42,26 +42,7 @@ jobs:
       # and `toolchain link` so `cargo +nightly` still resolves.
       - name: Install nightly (eBPF program)
         if: runner.os == 'Linux'
-        run: |
-          set -euo pipefail
-          try_install() {
-            rustup toolchain install "$1" --profile minimal --component rust-src
-          }
-          if try_install nightly; then
-            rustc +nightly -vV
-            exit 0
-          fi
-          echo "::warning::latest nightly is missing rust-src; walking back dates"
-          for i in $(seq 1 14); do
-            spec="nightly-$(date -u -d "$i days ago" +%F)"
-            if try_install "$spec"; then
-              rustup toolchain link nightly "$(rustc "+$spec" --print sysroot)"
-              rustc +nightly -vV
-              exit 0
-            fi
-          done
-          echo "::error::no nightly with rust-src in the last 14 days"
-          exit 1
+        run: bash scripts/ci-bpf-toolchain.sh
 
       - name: Install stable
         uses: dtolnay/rust-toolchain@stable
