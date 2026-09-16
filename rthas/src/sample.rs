@@ -639,7 +639,18 @@ mod tests {
         // A process that has run at all has burned some CPU and owns memory.
         assert!(cpu_count() >= 1);
         assert!(rss_bytes() > 0, "rss should be readable");
-        assert!(cpu_time() > std::time::Duration::ZERO);
+        // Linux /proc accounts CPU in USER_HZ ticks (usually 10ms). This test
+        // can be scheduled before a whole tick has been charged, so burn one.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let mut used = cpu_time();
+        while used == std::time::Duration::ZERO && std::time::Instant::now() < deadline {
+            std::hint::black_box((0..50_000u32).fold(0u32, |a, b| a.wrapping_add(b)));
+            used = cpu_time();
+        }
+        assert!(
+            used > std::time::Duration::ZERO,
+            "cpu_time should become readable after burning a tick"
+        );
         // Load average can legitimately be 0 on a quiet box, so only require
         // that it parse into a finite number.
         assert!(load_avg().is_finite());
