@@ -42,26 +42,28 @@ fn build_ebpf() -> Result<(), String> {
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let target_dir = out.join("bpf-target");
 
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let mut cmd = Command::new(&cargo);
-    cmd.args([
-        "+nightly",
-        "build",
-        "--release",
-        "--manifest-path",
-    ])
-    .arg(&prog)
-    .args(["--target", "bpfel-unknown-none", "-Z", "build-std=core"])
-    .env("CARGO_TARGET_DIR", &target_dir);
-    // Nested cargo deadlocks if it reuses the parent's rustflags encoding.
+    // Do not use `$CARGO`: that is the current toolchain's cargo binary, which
+    // treats `+nightly` as a subcommand (`no such command: +nightly`). The
+    // parent build also exports `RUSTC` / `RUSTUP_TOOLCHAIN` for stable; strip
+    // those so the nested compile actually uses nightly + `-Z build-std`.
+    let mut cmd = Command::new("rustup");
+    cmd.args(["run", "nightly", "cargo", "build", "--release", "--manifest-path"])
+        .arg(&prog)
+        .args(["--target", "bpfel-unknown-none", "-Z", "build-std=core"])
+        .env("CARGO_TARGET_DIR", &target_dir);
+    cmd.env_remove("CARGO");
+    cmd.env_remove("RUSTC");
+    cmd.env_remove("RUSTC_WRAPPER");
+    cmd.env_remove("RUSTC_WORKSPACE_WRAPPER");
+    cmd.env_remove("RUSTUP_TOOLCHAIN");
     cmd.env_remove("CARGO_ENCODED_RUSTFLAGS");
     cmd.env_remove("RUSTFLAGS");
 
     let status = cmd
         .status()
-        .map_err(|e| format!("spawn cargo +nightly: {e}"))?;
+        .map_err(|e| format!("spawn rustup run nightly cargo: {e}"))?;
     if !status.success() {
-        return Err(format!("cargo +nightly exited {status}"));
+        return Err(format!("rustup run nightly cargo exited {status}"));
     }
 
     let built = target_dir

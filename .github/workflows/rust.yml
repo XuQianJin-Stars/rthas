@@ -33,7 +33,7 @@ jobs:
       - uses: actions/checkout@v4
 
       # Nightly first, then stable, so `cargo` stays on stable while
-      # rthas-ebpf/build.rs can still invoke `cargo +nightly`.
+      # rthas-ebpf/build.rs invokes `rustup run nightly cargo`.
       #
       # Do not `rustup target add bpfel-unknown-none`: that target has no
       # prebuilt std, so rustup fails with DistError on most nightlies.
