@@ -1,0 +1,63 @@
+# In-process probes build on Linux and macOS. `rthas-ebpf` userspace tests also
+# run on macOS; compiling the BPF object (rthas-ebpf-prog) is Linux-only and
+# needs nightly + rust-src + bpfel-unknown-none + bpf-linker.
+name: Rust
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Nightly first, then stable, so `cargo` stays on stable while
+      # rthas-ebpf/build.rs can still invoke `cargo +nightly`.
+      - name: Install nightly (eBPF program)
+        if: runner.os == 'Linux'
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: bpfel-unknown-none
+
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install bpf-linker
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-binstall
+
+      - name: cargo binstall bpf-linker
+        if: runner.os == 'Linux'
+        run: cargo binstall --no-confirm --force bpf-linker
+
+      - name: Build
+        run: cargo build --workspace --locked --verbose
+
+      - name: Run tests
+        run: cargo test --workspace --all-features --locked --verbose
