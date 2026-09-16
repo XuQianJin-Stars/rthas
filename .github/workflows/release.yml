@@ -8,6 +8,12 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "GitHub Release tag to create or update"
+        required: true
+        default: "v0.1.0"
+        type: string
 
 permissions:
   contents: write
@@ -103,7 +109,7 @@ jobs:
   publish:
     needs: [linux, darwin]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -118,6 +124,8 @@ jobs:
           cp ../install.sh .
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
           files: |
             dist/rthas-linux-amd64
             dist/rthas-linux-arm64
@@ -126,3 +134,4 @@ jobs:
             dist/install.sh
             dist/SHA256SUMS
           generate_release_notes: true
+          make_latest: true
