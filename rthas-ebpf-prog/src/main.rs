@@ -54,10 +54,11 @@ fn submit(ctx: &impl EbpfContext, kind: u8) -> u32 {
         return 0;
     };
     let ev = RawEvent {
-        ts_ns: bpf_ktime_get_ns(),
-        // SAFETY: `ctx` is the probe context the kernel passed to this program.
+        // SAFETY: these helpers are the kernel BPF helpers; `ctx` is the
+        // probe context passed into this program.
+        ts_ns: unsafe { bpf_ktime_get_ns() },
         ip: unsafe { bpf_get_func_ip(ctx.as_ptr()) },
-        tid: bpf_get_current_pid_tgid() as u32,
+        tid: unsafe { bpf_get_current_pid_tgid() } as u32,
         kind,
         _pad: [0; 3],
     };
