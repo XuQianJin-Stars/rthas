@@ -9,7 +9,7 @@
 
 ```bash
 curl -fsSL https://github.com/XuQianJin-Stars/rthas/releases/latest/download/install.sh | bash
-# Linux: one binary, eBPF helper embedded. macOS: CLI only.
+# Linux: musl-static binary, eBPF helper embedded. macOS: CLI only.
 ```
 
 See [Install](https://xuqianjin-stars.github.io/rthas/install) for GitHub Release assets and building from source.

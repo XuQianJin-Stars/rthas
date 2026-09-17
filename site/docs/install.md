@@ -39,6 +39,8 @@ sudo ./rthas attach --ebpf <pid>
 | `rthas-darwin-arm64` | no (macOS has no uprobe API) |
 | `rthas-darwin-amd64` | no |
 
+Linux assets are **musl-static**. They do not need the host glibc, so TencentOS, CentOS, and RHEL work; a GNU build from Ubuntu 24.04 would require GLIBC 2.39.
+
 You do **not** need nightly rustc or `bpf-linker` on the machine that runs the release binary. Those are only used when GitHub Actions **builds** the Linux assets.
 
 `VERSION=v0.1.0 PREFIX=/usr/local` can be set before `install.sh`.
